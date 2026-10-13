@@ -11,10 +11,18 @@ import { REASON, WbError } from '../errors.js';
 import { regionOfDomain } from '../upstream/domains.js';
 import { ownStateDir } from '../paths.js';
 import { resolveDesktopCandidates } from './discover.js';
-import { keyIdsOf, classifyAuthDocument, openField, protectorKeysFromPayload, unwrapDocument } from './at-rest.js';
+import {
+  keyIdOf,
+  keyIdsOf,
+  classifyAuthDocument,
+  openField,
+  protectorKeysFromPayload,
+  unwrapDocument,
+} from './at-rest.js';
 import { loadAtRestPayload, resolveElectronBinary } from './electron.js';
-import { parseAuthDocument, parseOwnDocument } from './document.js';
-import { readOwn, removeOwn } from './store.js';
+import { parseAuthDocument } from './document.js';
+import { readOwn, writeOwn, removeOwn, ownFileMode } from './store.js';
+import { KEY_SOURCE_AT_REST, KEY_SOURCE_NONE, createOsKeyStore, sealCredential } from './protection.js';
 
 /** The key payload plus where the binary came from, for diagnostics. */
 class ProtectorKeyProvider {
@@ -61,6 +69,86 @@ class ProtectorKeyProvider {
   }
 }
 
+/**
+ * Resolves the key that protects this project's own credential copy (SF-6).
+ *
+ * Sealing prefers the app's own at-rest key, because that key is already needed
+ * to read the desktop credential and costs no extra step. When it cannot be
+ * produced (plaintext desktop install, no app), an OS key facility is used.
+ * When neither exists, the copy is written as plaintext and the caller is told
+ * so explicitly -- there is no silent downgrade.
+ */
+class OwnCopyProtector {
+  #degradedWarned = false;
+
+  constructor({ keyProvider, osKeyStore, logger }) {
+    this.keyProvider = keyProvider;
+    this.osKeyStore = osKeyStore;
+    this.logger = logger;
+  }
+
+  /** The app's at-rest key, or undefined when it cannot be produced. */
+  async #atRestKey() {
+    try {
+      const keys = await this.keyProvider.keys();
+      return keys.key;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** A key held by the OS facility, creating one on first use. */
+  async #osKey() {
+    const store = this.osKeyStore;
+    if (store === undefined || !store.available()) return undefined;
+    try {
+      const existing = await store.load();
+      if (existing !== undefined) return existing;
+      if (!(await store.store(undefined))) return undefined;
+      return await store.load();
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Seal the serialized credential; reports the key source or the degradation. */
+  async seal(text) {
+    const atRestKey = await this.#atRestKey();
+    if (atRestKey !== undefined) {
+      return { sealed: sealCredential(text, atRestKey), keySource: KEY_SOURCE_AT_REST };
+    }
+    const osKey = await this.#osKey();
+    if (osKey !== undefined) {
+      return { sealed: sealCredential(text, osKey), keySource: this.osKeyStore.source };
+    }
+    const degraded = {
+      reason: 'no-protection-available',
+      message: 'neither the app at-rest key nor an OS key facility is available; the credential copy is stored as plaintext',
+    };
+    // A runtime degradation must not be silent: the startup warning only covers
+    // the case where both were already known to be missing.
+    if (this.#degradedWarned !== true) {
+      this.#degradedWarned = true;
+      this.logger?.warn?.(`SF-6 DEGRADED at runtime: ${degraded.message}. See docs/security.md.`);
+    }
+    return { keySource: KEY_SOURCE_NONE, degraded };
+  }
+
+  /** Produce the key a stored record needs, or undefined when it is unavailable. */
+  async openKey(record) {
+    if (record.keySource === KEY_SOURCE_AT_REST) {
+      const key = await this.#atRestKey();
+      if (key === undefined) return undefined;
+      if (typeof record.keyId === 'string' && record.keyId !== '' && keyIdOf(key) !== record.keyId) return undefined;
+      return key;
+    }
+    if (this.osKeyStore !== undefined && record.keySource === this.osKeyStore.source) {
+      return await this.#osKey();
+    }
+    return undefined;
+  }
+}
+
 export class CredentialStore {
   /**
    * @param {object} options
@@ -70,7 +158,10 @@ export class CredentialStore {
    * @param {object} [options.env]
    * @param {string} [options.ownDir]
    * @param {(path: string) => Promise<string>} [options.fileReader]
-   * @param {(path: string) => string|undefined} [options.ownReader]
+   * @param {object} [options.osKeyStore] injectable OS key facility (tests)
+   * @param {'win32'|'darwin'|'linux'} [options.plat] platform override (tests)
+   * @param {Function} [options.runOsHelper] process runner for the OS facility (tests)
+   * @param {object} [options.logger] warns when a copy write degrades at runtime (SF-3)
    */
   constructor(options) {
     this.variant = options.variant;
@@ -78,7 +169,6 @@ export class CredentialStore {
     this.env = options.env ?? process.env;
     this.ownDir = options.ownDir ?? ownStateDir(this.env);
     this.fileReader = options.fileReader ?? ((filePath) => readFile(filePath, 'utf8'));
-    this.ownReader = options.ownReader ?? readOwn;
     this.keyProvider = new ProtectorKeyProvider({
       variant: options.variant,
       electronPath: options.electronPath,
@@ -86,7 +176,18 @@ export class CredentialStore {
       run: options.run,
       readAtRest: options.readAtRest,
     });
+    this.osKeyStore = options.osKeyStore ?? createOsKeyStore({
+      dir: this.ownDir,
+      plat: options.plat,
+      env: this.env,
+      run: options.runOsHelper,
+    });
+    this.protector = new OwnCopyProtector({ keyProvider: this.keyProvider, osKeyStore: this.osKeyStore, logger: options.logger });
     this.lastElectronPath = undefined;
+    /** The last own-copy protection actually used (for /healthz and reports). */
+    this.lastProtection = undefined;
+    /** A failure while reading the own copy; never collapsed into "no copy". */
+    this.lastOwnCopyError = undefined;
   }
 
   get ownPath() {
@@ -187,9 +288,34 @@ export class CredentialStore {
     };
   }
 
-  /** Read the project-owned copy (never refreshes). */
-  readOwnCopy() {
-    return this.ownReader(this.ownPath);
+  /** Read the project-owned copy, opening it when sealed. Never refreshes. */
+  async readOwnCopy() {
+    try {
+      const record = await readOwn(this.ownPath, { openKey: (opened) => this.protector.openKey(opened) });
+      this.lastOwnCopyError = undefined;
+      if (record !== undefined) {
+        this.lastProtection = {
+          protection: record.protection,
+          keySource: record.keySource,
+          legacy: record.legacy === true,
+        };
+      }
+      return record?.credential;
+    } catch (error) {
+      this.lastOwnCopyError = error;
+      return undefined;
+    }
+  }
+
+  /** Write the project-owned copy with its at-rest protection (SF-6). */
+  async writeOwnCopy(credential) {
+    const result = await writeOwn(this.ownPath, credential, { protector: this.protector });
+    this.lastProtection = {
+      protection: result.keySource === KEY_SOURCE_NONE ? 'plaintext' : 'aes-256-gcm',
+      keySource: result.keySource,
+      ...(result.degraded === undefined ? {} : { degraded: result.degraded }),
+    };
+    return result;
   }
 
   /**
@@ -198,7 +324,7 @@ export class CredentialStore {
    */
   async current() {
     const desktop = await this.readDesktop();
-    const own = this.readOwnCopy();
+    const own = await this.readOwnCopy();
 
     const checkRegion = (credential, label) => {
       const region = regionOfDomain(credential.domain);
@@ -212,8 +338,14 @@ export class CredentialStore {
     if (desktop !== undefined) checkRegion(desktop.credential, 'desktop file');
     if (own !== undefined) checkRegion(own, 'project copy');
 
-    if (desktop === undefined && own === undefined) return undefined;
-    if (desktop === undefined) return { credential: own, source: 'own-copy', format: 'plaintext' };
+    if (desktop === undefined && own === undefined) {
+      // A copy that exists but cannot be opened must not read as "not signed in".
+      if (this.lastOwnCopyError !== undefined) throw this.lastOwnCopyError;
+      return undefined;
+    }
+    if (desktop === undefined) {
+      return { credential: own, source: 'own-copy', format: 'plaintext' };
+    }
     const base = { ...desktop, format: desktop.format };
     if (own === undefined) return { ...base, credential: desktop.credential, source: 'desktop' };
 
@@ -223,7 +355,7 @@ export class CredentialStore {
     return { ...base, credential: useOwn ? own : desktop.credential, source: useOwn ? 'own-copy' : 'desktop' };
   }
 
-  /** Remove the project-owned copy. The desktop file is untouched. */
+  /** Remove the project-owned copy (logout). The desktop file is untouched. */
   removeOwnCopy() {
     return removeOwn(this.ownPath);
   }

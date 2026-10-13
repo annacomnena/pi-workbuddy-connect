@@ -14,6 +14,7 @@ export const REASON = Object.freeze({
   electronDiscoveryIncomplete: 'electron-discovery-incomplete',
   credentialRegionMismatch: 'credential-region-mismatch',
   sessionDead: 'session-dead',
+  sessionRefreshFailed: 'session-refresh-failed',
   creditExhausted: 'credit-exhausted',
   rateLimited: 'rate-limited',
   billingUnreachable: 'billing-unreachable',
@@ -22,6 +23,15 @@ export const REASON = Object.freeze({
   networkDisabled: 'network-disabled',
   upstreamClientError: 'upstream-client-error',
   upstreamServerError: 'upstream-server-error',
+  // Gateway (S1) states. The gateway never collapses a diagnosable failure into
+  // a generic "bad request": each one maps to a distinct HTTP status and to a
+  // distinct OpenAI error `type`.
+  invalidRequest: 'invalid-request',
+  gatewayForbidden: 'gateway-forbidden',
+  gatewayUnauthorized: 'gateway-unauthorized',
+  gatewayCooling: 'gateway-cooling',
+  gatewayTokenUnavailable: 'gateway-token-unavailable',
+  ownCopyUnprotected: 'own-copy-unprotected',
 });
 
 /** An error that always travels with a machine-readable reason code. */

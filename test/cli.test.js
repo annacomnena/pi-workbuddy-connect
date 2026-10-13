@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { execFile } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -164,4 +165,75 @@ test('finalizeDocument passes a clean document', () => {
   const { text, ok } = finalizeDocument({ schema: 1, command: 'status', value: 'ok' }, ['a-secret'], true);
   assert.equal(ok, true);
   assert.equal(JSON.parse(text).redactionSelfCheck.ok, true);
+});
+
+// ---------------------------------------------------------------------------
+// `serve` — the S1 gateway, driven as a real child process over loopback only.
+// ---------------------------------------------------------------------------
+
+test('serve refuses --no-network instead of silently serving nothing', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pwc-serve-'));
+  const { code, stderr } = await run(['serve', '--no-network'], { APPDATA: dir });
+  assert.equal(code, 2);
+  assert.match(stderr, /drop --no-network/);
+});
+
+test('serve rejects an unusable port', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pwc-serve-'));
+  const { code, stderr } = await run(['serve', '--port', 'nope'], { APPDATA: dir });
+  assert.equal(code, 2);
+  assert.match(stderr, /--port must be an integer/);
+});
+
+test('serve starts, announces endpoint.json, answers /healthz without a bearer, and stops cleanly', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pwc-serve-'));
+  const auth = join(dir, 'workbuddy-desktop.info');
+  writeFileSync(auth, JSON.stringify(makePlainAuthDocument()));
+  const endpointPath = join(dir, 'pi-workbuddy-connect', 'endpoint.json');
+  const { spawn } = await import('node:child_process');
+  const child = spawn(process.execPath, [BIN, 'serve', '--port', '0', '--auth-file', auth], {
+    env: { ...process.env, APPDATA: dir },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  const stdout = [];
+  child.stdout.on('data', (chunk) => stdout.push(chunk));
+  child.stderr.on('data', () => {});
+  try {
+    // Wait for the endpoint announcement.
+    let announced;
+    for (let attempt = 0; attempt < 100 && announced === undefined; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      try {
+        announced = JSON.parse(readFileSync(endpointPath, 'utf8'));
+      } catch {
+        announced = undefined;
+      }
+    }
+    assert.ok(announced, 'the gateway never wrote endpoint.json');
+    assert.equal(announced.host, '127.0.0.1');
+    assert.ok(announced.port > 0);
+    assert.equal('token' in announced, false, 'endpoint.json must not carry the secret');
+
+    const res = await new Promise((resolve, reject) => {
+      const req = httpRequest({ host: '127.0.0.1', port: announced.port, path: '/healthz' }, (response) => {
+        const chunks = [];
+        response.on('data', (chunk) => chunks.push(chunk));
+        response.on('end', () => resolve({ status: response.statusCode, text: Buffer.concat(chunks).toString('utf8') }));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    assert.equal(res.status, 200);
+    const health = JSON.parse(res.text);
+    assert.equal(health.service, 'pi-workbuddy-connect');
+    assert.equal(health.credential.state, 'active');
+    assert.equal(res.text.includes(FAKE_ACCESS_TOKEN), false);
+  } finally {
+    child.kill('SIGINT');
+    const exit = await new Promise((resolve) => child.once('exit', (exitCode, signal) => resolve({ exitCode, signal })));
+    // Windows cannot deliver SIGINT to a child: the process is terminated with
+    // the signal instead of running the handler. Either way it must be gone.
+    assert.ok(exit.exitCode === 0 || exit.signal === 'SIGINT' || process.platform === 'win32', JSON.stringify(exit));
+  }
+  assert.equal(stdout.join('').includes('serve'), true);
 });

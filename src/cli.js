@@ -20,14 +20,17 @@ import { resolveCatalog } from './catalog/index.js';
 import { LEAK_PATTERNS, findLeaks } from './util/redact.js';
 import { maskIdentifier, maskKeyId, maskSecret } from './util/mask.js';
 import { displayPath } from './paths.js';
+import { DEFAULT_PORT, TOKEN_ENV, PORT_ENV } from './gateway/secret.js';
+import { startServe } from './serve.js';
 
 export const SCHEMA_VERSION = 1;
 
-export const USAGE = `pi-workbuddy-connect — read-only WorkBuddy status/doctor (S3)
+export const USAGE = `pi-workbuddy-connect — local WorkBuddy access (S3 read-only CLI + S1 gateway)
 
 Usage:
   pi-workbuddy-connect status [options]   read the local sign-in and credit balance
   pi-workbuddy-connect doctor [options]   diagnose why the local sign-in is unusable
+  pi-workbuddy-connect serve [options]    run the loopback OpenAI-compatible gateway
 
 Options:
   --json                 machine-readable output
@@ -37,6 +40,7 @@ Options:
   --no-network           local only; do not contact any upstream host
   --catalog              status: refresh the model catalog live (one extra request)
   --decrypt              doctor: actually unwrap the credential (runs the app's key helper)
+  --port <n>             serve: listening port on 127.0.0.1 (default ${DEFAULT_PORT}; env: ${PORT_ENV})
   --help                 this text
   --version              print the version
 
@@ -45,10 +49,16 @@ Notes:
     binary once, locally) and then reads the balance. That is the only upstream
     request it makes unless --catalog is given.
   * doctor never sends credentials and never prints one; it reports reason codes.
+  * serve binds 127.0.0.1 ONLY and requires a random per-process bearer secret
+    (this project's gateway.json, overridable with ${TOKEN_ENV}).
+    GET /healthz needs no bearer; every other route does. The gateway does no
+    local billing: the upstream charges per token on the server side.
 
 This tool is unofficial and unrelated to Tencent. It only reuses the sign-in of
 your own local app, spends your own credits, and writes nothing to the app.
 `;
+
+export const SERVE_STOP_HINT = 'press Ctrl+C to stop the gateway';
 
 /** Parse argv into a command and flags. */
 export function parseArgs(argv) {
@@ -59,6 +69,7 @@ export function parseArgs(argv) {
     switch (token) {
       case 'status':
       case 'doctor':
+      case 'serve':
         if (command !== undefined) return { error: `unexpected command ${JSON.stringify(token)}` };
         command = token;
         break;
@@ -71,10 +82,12 @@ export function parseArgs(argv) {
       case '--variant': flags.variant = argv[++index]; break;
       case '--auth-file': flags.authFile = argv[++index]; break;
       case '--electron': flags.electron = argv[++index]; break;
+      case '--port': flags.port = argv[++index]; break;
       default:
         if (token.startsWith('--variant=')) flags.variant = token.slice('--variant='.length);
         else if (token.startsWith('--auth-file=')) flags.authFile = token.slice('--auth-file='.length);
         else if (token.startsWith('--electron=')) flags.electron = token.slice('--electron='.length);
+        else if (token.startsWith('--port=')) flags.port = token.slice('--port='.length);
         else return { error: `unknown argument ${JSON.stringify(token)}` };
     }
   }
@@ -412,6 +425,17 @@ function renderSessionHuman(session) {
 
 function renderHuman(document) {
   const lines = [];
+  if (document.command === 'serve') {
+    lines.push(`pi-workbuddy-connect serve — ${document.variantName} (${document.variant}, region ${document.region})`);
+    lines.push(`listening: ${document.url} (${document.bind ?? document.host} only)`);
+    lines.push(`bearer: ${document.token.source} — ${document.token.path} (value not printed)`);
+    lines.push(`user-agent: ${document.userAgent} (app version ${document.appVersion.value}, ${document.appVersion.source})`);
+    lines.push(`endpoint file: ${document.endpointFile}`);
+    lines.push(`routes: /healthz (no bearer) · /v1/models · /v1/chat/completions · /v1/workbuddy/credits (non-standard)`);
+    lines.push(`outbound: ${document.outbound.hosts.join(', ')} — telemetry ${document.outbound.telemetry}`);
+    for (const warning of document.warnings ?? []) lines.push(`warning: ${warning}`);
+    return `${lines.join('\n')}\n`;
+  }
   if (document.command === 'status') {
     lines.push(`pi-workbuddy-connect status — ${document.variantName} (${document.variant})`);
     lines.push(`auth file: ${document.auth?.desktopPath ?? '(none)'}${document.auth?.format ? ` [${document.auth.format}]` : ''}`);
@@ -446,6 +470,36 @@ function renderHuman(document) {
   return `${lines.join('\n')}\n`;
 }
 
+/** Run the gateway until a termination signal arrives. */
+export async function runServe(options, { out = process.stdout, err = process.stderr, env = process.env, start = startServe, home } = {}) {
+  if (options.network === false) {
+    err.write('serve needs upstream access: drop --no-network\n');
+    return 2;
+  }
+  const logger = {
+    info: (message) => out.write(`${message}\n`),
+    warn: (message) => err.write(`warning: ${message}\n`),
+    error: (message) => err.write(`error: ${message}\n`),
+  };
+  let serving;
+  try {
+    serving = await start(options, { out, logger, home, env });
+  } catch (error) {
+    err.write(`could not start the gateway: ${describeError(error)}\n`);
+    return 1;
+  }
+  const { text } = finalizeDocument(serving.document, [], options.json);
+  out.write(text);
+  out.write(`${SERVE_STOP_HINT}\n`);
+  await new Promise((resolve) => {
+    process.once('SIGINT', resolve);
+    process.once('SIGTERM', resolve);
+  });
+  await serving.close();
+  out.write('gateway stopped\n');
+  return 0;
+}
+
 /** Run the CLI; returns the process exit code. */
 export async function runCli(argv, { out = process.stdout, err = process.stderr, env = process.env, builders } = {}) {
   const parsed = parseArgs(argv);
@@ -468,6 +522,10 @@ export async function runCli(argv, { out = process.stdout, err = process.stderr,
   } catch (error) {
     err.write(`${describeError(error)}\n`);
     return 2;
+  }
+
+  if (parsed.command === 'serve') {
+    return await runServe(options, { out, err, env });
   }
 
   // Shared with buildStatus/buildDoctor so the catch below can self-check the

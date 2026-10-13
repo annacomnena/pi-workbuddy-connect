@@ -70,15 +70,39 @@ export function parseAuthText(text, source = 'desktop') {
   return parseAuthDocument(parsed, source);
 }
 
-export const OWN_FORMAT_VERSION = 1;
+export const OWN_FORMAT_VERSION = 2;
+export const OWN_LEGACY_VERSION = 1;
 
-/** Serialize the project-owned copy. */
-export function serializeOwn(credential) {
-  return `${JSON.stringify({ version: OWN_FORMAT_VERSION, credential }, null, 2)}\n`;
+/** Serialize a plaintext project-owned copy (the degraded path). */
+export function serializeOwn(credential, keySource = 'none') {
+  return `${JSON.stringify({
+    version: OWN_FORMAT_VERSION,
+    protection: 'plaintext',
+    keySource,
+    credential,
+  }, null, 2)}\n`;
 }
 
-/** Parse the project-owned copy; other versions and shapes are rejected. */
-export function parseOwnDocument(text) {
+/** Serialize a sealed project-owned copy (SF-6 default). */
+export function serializeOwnSealed(sealed, keySource) {
+  return `${JSON.stringify({
+    version: OWN_FORMAT_VERSION,
+    protection: sealed.protection,
+    keySource,
+    keyId: sealed.keyId,
+    nonce: sealed.nonce,
+    authTag: sealed.authTag,
+    ciphertext: sealed.ciphertext,
+  }, null, 2)}\n`;
+}
+
+/**
+ * Read the project-owned copy's envelope without opening it.
+ *
+ * @returns {{ version: number, protection: 'plaintext'|'aes-256-gcm', keySource: string,
+ *   keyId?: string, sealed?: object, credential?: object, legacy?: boolean } | undefined}
+ */
+export function readOwnDocument(text) {
   let parsed;
   try {
     parsed = JSON.parse(text);
@@ -86,9 +110,51 @@ export function parseOwnDocument(text) {
     return undefined;
   }
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined;
+  if (parsed.version === OWN_LEGACY_VERSION) {
+    if (typeof parsed.credential !== 'object' || parsed.credential === null) return undefined;
+    return { version: OWN_LEGACY_VERSION, protection: 'plaintext', keySource: 'none', credential: parsed.credential, legacy: true };
+  }
   if (parsed.version !== OWN_FORMAT_VERSION) return undefined;
-  if (typeof parsed.credential !== 'object' || parsed.credential === null) return undefined;
-  const stored = parsed.credential;
+  if (parsed.protection === 'plaintext') {
+    if (typeof parsed.credential !== 'object' || parsed.credential === null) return undefined;
+    return {
+      version: OWN_FORMAT_VERSION,
+      protection: 'plaintext',
+      keySource: typeof parsed.keySource === 'string' ? parsed.keySource : 'none',
+      credential: parsed.credential,
+    };
+  }
+  if (parsed.protection === 'aes-256-gcm') {
+    if (typeof parsed.nonce !== 'string' || typeof parsed.authTag !== 'string' || typeof parsed.ciphertext !== 'string') {
+      return undefined;
+    }
+    return {
+      version: OWN_FORMAT_VERSION,
+      protection: 'aes-256-gcm',
+      keySource: typeof parsed.keySource === 'string' ? parsed.keySource : 'unknown',
+      ...(typeof parsed.keyId === 'string' ? { keyId: parsed.keyId } : {}),
+      sealed: {
+        protection: 'aes-256-gcm',
+        keyId: typeof parsed.keyId === 'string' ? parsed.keyId : '',
+        nonce: parsed.nonce,
+        authTag: parsed.authTag,
+        ciphertext: parsed.ciphertext,
+      },
+    };
+  }
+  return undefined;
+}
+
+/** Parse an already-available plaintext project-owned copy; other shapes are rejected. */
+export function parseOwnDocument(text) {
+  const record = readOwnDocument(text);
+  if (record === undefined || record.credential === undefined) return undefined;
+  return normalizeOwnCredential(record.credential);
+}
+
+/** Normalize a stored credential object (shared by every own-copy shape). */
+export function normalizeOwnCredential(stored) {
+  if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) return undefined;
   if (typeof stored.accessToken !== 'string' || stored.accessToken === '') return undefined;
   const refreshExpiresAtMs = typeof stored.refreshExpiresAtMs === 'number' ? stored.refreshExpiresAtMs : undefined;
   const enterpriseId = optionalString(stored.enterpriseId);

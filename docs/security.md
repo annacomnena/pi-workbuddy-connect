@@ -27,17 +27,42 @@ internal storage binding for the payload.
 ## 3. Loopback gateway
 
 `loopback bind is not a trust boundary` — any local process, and any DNS-rebinding web page, can reach
-`127.0.0.1`. Therefore the gateway enforces **four gates before routing**:
+`127.0.0.1`. Therefore the gateway enforces **four gates before it dispatches to a route or calls the
+upstream**:
 
 1. **Host header must be loopback** (`127.0.0.1` / `localhost` / `[::1]`) — defeats DNS rebinding.
+   A failure is **403**.
 2. **Browser Origin must be loopback** (requests without an Origin are non-browser and are allowed).
-3. **Bearer token must equal a per-process random secret**, compared in constant time. The secret is
-   generated fresh per process, kept in memory, never written to disk and never sent anywhere except
-   toward the local gateway.
-4. **`Content-Type: application/json`** on chat POSTs — a low-cost CSRF backstop.
+   A failure is **403**.
+3. **Bearer token must equal this process's secret**, compared with `timingSafeEqual` after a length
+   check. A missing or wrong bearer is **401**. The secret is 32 random bytes generated on first start
+   and stored in `gateway.json` in this project's own state directory (0600 requested; on Windows,
+   inherited ACL only). `WORKBUDDY_GATEWAY_TOKEN` overrides it and, when set, nothing is persisted.
+   **`/healthz` is deliberately exempt**: it is the readiness probe, it returns no credential
+   material, and it never contacts the upstream.
+4. **`Content-Type: application/json`** on non-GET requests — a low-cost CSRF backstop. A failure is
+   **415**.
 
-Additional hardening: a request body size limit, and an idle timeout on upstream streams with
-`[DONE]` termination so clients do not hang on a truncated stream.
+The listening address is never configurable: the server binds `127.0.0.1` only, and the actual port is
+announced in `endpoint.json` (which never contains the secret).
+
+Route matching happens between gates 2 and 3: an unknown path is answered **404 `not_found` before the
+bearer is checked**, so an unauthenticated caller can tell an existing route from a missing one. No
+route data is exposed and no upstream call is made, so this is not a security boundary — the wording
+above is deliberately "before dispatch", not "before routing".
+
+Additional hardening: a 64 MiB request body cap, per-model cooldowns read from upstream `429`/`402`
+answers (`Retry-After` or a UTC+8 timestamp in the body, capped at 2 h) so a throttled model is refused
+immediately instead of being retried, and truncation signalling when an upstream stream breaks: if no
+byte has been forwarded yet the request fails as **502** with an OpenAI error body, and if the stream
+breaks mid-answer the gateway appends a `workbuddy_truncated` SSE frame before `data: [DONE]` so a
+partial answer is distinguishable from a complete one. A clean upstream `end` without `[DONE]` is marked
+the same way.
+
+The gateway performs **no local accounting**: no pre-deduction, no ledger, no balance gate. Usage and
+charging are computed **server-side by the upstream**; this tool does not claim that any particular
+request was charged, only that it performs no local billing. `/healthz` requires no bearer and is
+readable by **any local process** (it carries masked metadata only, never a credential).
 
 ## 4. Outbound traffic
 
@@ -51,7 +76,27 @@ Additional hardening: a request body size limit, and an idle timeout on upstream
 - CI scans the tree for token-like patterns and fails on a hit.
 - Documentation and issues must reference **field names**, never values.
 
-## 6. Owner-copy permissions (S3)
+## 6. Owner-copy storage protection (S1, SF-6)
+
+The project's own credential copy (written only after a successful token refresh — never the desktop
+file) is **no longer plaintext by default**. Its format records which protection was used:
+
+| Order | Protection (`protection` / `keySource`) | When it applies |
+|---|---|---|
+| 1 | `aes-256-gcm` / `at-rest-key` | The app's own at-rest key is available (the normal case: the desktop credential is an encrypted envelope, and the same key unwraps it). A fresh random nonce per write; AAD binds the blob to this project and format version. |
+| 2 | `aes-256-gcm` / `os-dpapi` \| `os-keychain` \| `os-libsecret` | No at-rest key available (plaintext desktop install): a dedicated 32-byte key is generated and handed to **Windows DPAPI (CurrentUser)**, **macOS Keychain**, or **Linux libsecret**. DPAPI stores the wrapped blob in `own-copy.key` beside the copy; the other two store it in the OS store itself. |
+| 3 | `plaintext` / `none` | **Only** when neither is available. This is an explicit degradation: the gateway logs `SF-6 DEGRADED: …` at startup and it is listed in the `serve` document. Permissions stay best-effort 0600 on POSIX and inherited-ACL on Windows. |
+
+Rules that make this fail closed rather than fail open:
+
+- A sealed copy whose key cannot be produced is reported as `credential-undecryptable` — it is **never**
+  read as "no copy" and never silently downgraded to the desktop file when no desktop file exists.
+- A `keyId` mismatch (rotated at-rest key) is a failure, not a retry against another key.
+- The OS helpers run local system tools (`powershell.exe` with an encoded command, `/usr/bin/security`,
+  `/usr/bin/secret-tool`) with a fixed argument list, a 10 s timeout and a 64 KiB output cap. No key or
+  credential is ever sent anywhere.
+
+## 6b. Owner-copy permissions
 
 A refreshed token, if one is ever written, goes to a project-owned directory with owner-only
 permissions:
@@ -64,8 +109,9 @@ permissions:
 
 Notes and residual risks:
 
-- The at-rest key used to unwrap the desktop credential is held **in memory only**. It is never
-  written to disk, never cached, and never sent anywhere.
+- The at-rest key used to unwrap the desktop credential is held **in memory only** for the duration of
+  a resolve. It is never sent anywhere. (The only thing ever written is the *copy* sealed with it, or a
+  DPAPI/Keychain/libsecret-wrapped key beside the copy — never the key itself in the clear.)
 - A copy in a home directory may still be captured by backups, file-sync clients, or a shared
   machine. Excluding the path above from sync/backup is the owner's responsibility.
 - On Windows there is no POSIX mode; the copy is only as private as the user profile's ACLs. This is
@@ -84,3 +130,19 @@ pre-print token self-check.
 unreadable, undecryptable, region-mismatched, expired, and unreachable are separate reason codes. The
 `status` / `doctor` documents are scanned for token shapes and for the exact secrets the process holds
 before printing, and are withheld if a hit is found.
+
+The gateway fails closed in the same spirit, with the failure named in the response:
+
+| Situation | Response |
+|---|---|
+| no local credential | `401 not_signed_in` |
+| token expired and refresh failed | `401 session_dead` |
+| upstream says the session is gone (401 / `Offline user session not found` / `12153`) | `401 session_dead`, and the event is surfaced on `/healthz` (`credential.lastSessionDead`) |
+| own copy sealed and its key is gone | `502 credential-undecryptable` (never "not signed in") |
+| upstream 402 / credit marker | `402 hard_credit`, no retry |
+| upstream 429 | `429 soft_rate` + `Retry-After`, then a local per-model cooldown |
+| upstream unreachable / 5xx / non-JSON | `502` |
+| upstream 4xx | `400` |
+
+The gateway logs the model, status, latency and stream mode per answer. It never logs a prompt, a
+completion or a credential.

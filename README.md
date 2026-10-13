@@ -8,7 +8,7 @@
 
 ## 状态 / Status
 
-**研究阶段（research phase）** —— 协议事实正在核实中：
+**S3 只读 CLI 已实现并实测**（`status` / `doctor`，60+ 单测）；**S1 本地 OpenAI 兼容网关已实现**（`serve`，四道闸 / SSE / 目录降级 / per-model 冷却 / SF-6 加密副本），真实推理已跑通一轮（见 [`docs/dev/S1-report.md`](./docs/dev/S1-report.md)）。协议事实来源：
 
 - 上游同生态参考实现（公开、MIT）：[`dsh-workbuddy-connect`](https://github.com/corrinehu/dsh-workbuddy-connect) —— 我们**只借鉴其"观察到的协议事实"**，实现为**净室重写**；其中 AAD 帧布局 / 信封字段名 / 一次性 helper 调用是为互操作所必需的逐字协议事实（已在 `src/credentials/at-rest.js`、`electron.js` 文件头注明，并附上游 MIT 许可与版权于 [`THIRD-PARTY-NOTICES.md`](./THIRD-PARTY-NOTICES.md)），其余为独立重表达。
 - 本仓目标：**独立插件**（不依赖、也不集成进任何特定 harness 的 runtime），可独立运行。
@@ -28,7 +28,8 @@
 
 - 读取本机 WorkBuddy App 的**登录态**（只读）
 - 列出可用模型与**积分余额**（真实查询计费）
-- 把模型以 **OpenAI 兼容**方式暴露给本机客户端
+- 把模型以 **OpenAI 兼容**方式暴露在 `127.0.0.1`（`serve`；四道闸 + 随机密钥）
+- token 到期前按上游契约刷新，**只写自留副本**（加密存储，不回写 App 文件）
 
 **不做 / Don't**
 
@@ -36,6 +37,9 @@
 - ❌ 自动签到 / 刷额度（automated check-in / credit farming）
 - ❌ 绕过计费、限流或任何访问控制（no billing/rate-limit bypass）
 - ❌ 上传、外传或落库任何凭据 / token（no credential exfiltration — never commit tokens）
+- ❌ 本地余额预扣 / 记账 / 闸门（billing is the upstream's, per token, server-side）
+- ❌ 监听非回环地址、无密钥暴露、局域网或公网共享
+- ❌ 冷却期内换账号 / 换身份重试（no identity switching to dodge a rate limit）
 
 ## 快速开始（S3 只读 CLI）/ Quick start
 
@@ -99,6 +103,91 @@ redaction self-check: ok
 
 > 所有 token / uid / uin 都做掩码；`status --json` 用同样的掩码，并在打印前对输出做 token 正则自检，命中即**拒绝输出**（fail-closed）。真实凭据值从不出现在输出、日志、测试夹具或本仓库。
 
+## 本地网关（S1 · OpenAI 兼容）/ Loopback gateway
+
+在你的机器上开一个 **只绑 `127.0.0.1`** 的 OpenAI 兼容端点，把本机 App 的登录态接到任意客户端。
+Starts an OpenAI-compatible endpoint bound to `127.0.0.1` only, so any client can reuse your local app's sign-in.
+
+```bash
+node bin/pi-workbuddy-connect.js serve                 # 默认 127.0.0.1:8317
+node bin/pi-workbuddy-connect.js serve --port 9000     # 换端口（env：WORKBUDDY_GATEWAY_PORT）
+node bin/pi-workbuddy-connect.js serve --variant ai    # 国际版 WorkBuddy AI（需已安装并登录）
+```
+
+启动时会把**实际监听地址与端口**写进本仓自有目录的 `endpoint.json`（`0600`；Windows 上 `chmod` 是
+no-op，实际只与用户 profile 的继承 NTFS ACL 同私密性——文件里**不含密钥**）。网关密钥是**每次运行随机生成**
+的 32 字节串，存在自有目录的 `gateway.json`，可用环境变量 `WORKBUDDY_GATEWAY_TOKEN` 覆盖。
+
+### 路由 / Routes
+
+| 路由 | Bearer | 说明 |
+|---|---|---|
+| `GET /healthz` | **不需要** | 状态 / 版本 / 账号掩码摘要 / 是否可解密 / 冷却状态。不含任何凭据；**本机任意进程可读**（无鉴权） |
+| `GET /v1/models` | 需要 | OpenAI `{object:"list"}`，id 形如 `workbuddy/<modelId>`，含分组、上下文窗口、能力元数据；目录按 **live → saved → builtin** 降级并标明来源（`workbuddy_source`）。`?refresh=1` 强制实时刷新 |
+| `POST /v1/chat/completions` | 需要 | 支持 `stream:true`（SSE）与非流式；`stream:false` 时网关把上游 SSE 折叠成一个 `chat.completion` |
+| `GET /v1/workbuddy/credits` | 需要 | **非标准便利端点**（文档明示）：脱敏后的余额/资源包只读视图 |
+
+### 四道闸 / Four inbound gates
+
+`loopback bind is not a trust boundary`——本机任意进程、以及 DNS rebinding 页面都能访问 `127.0.0.1`，
+所以在**路由分发 / 上游调用之前**逐条检查：
+
+1. **Host 必须是回环**（`127.0.0.1` / `localhost` / `[::1]`）→ 否则 `403`
+2. **Origin 若存在必须是回环**（无 Origin 的非浏览器客户端放行）→ 否则 `403`
+3. **`Authorization: Bearer` 必须等于本进程密钥**（`timingSafeEqual` 常量时间比较；长度不同直接拒）→ 否则 `401`
+   （`/healthz` 例外：它只回状态，不含凭据，见 `docs/security.md`）
+4. **非 GET 请求必须声明 `application/json`** → 否则 `415`
+
+（精确顺序：Host → Origin → **路由匹配（未命中即 `404`）** → Bearer → 非 GET JSON → 方法；即 `404`
+先于 Bearer，未授权者可区分路由是否存在，但无数据暴露、不调上游。）
+
+另有请求体上限（64 MiB）与上游流中断的**截断信令**：**零字节已转发**时回 `502` + OpenAI 错误体；
+**已转发部分帧**时在 `data: [DONE]` 之前补一条 `workbuddy_truncated` 帧（与非流式折叠的
+`workbuddy_truncated` 标记一致），使残缺回复与完整回复可区分。状态码语义分清：**403 = 不是回环调用方**，
+**401 = 没有/错误的密钥**，**415 = 媒体类型不对**。
+
+### 计费 / Billing
+
+**网关不在本地做任何余额预扣、记账或闸门，也不主张某次请求被扣费。** 用量/计费由**上游服务端计算**：`usage` 由上游给出，
+余额只在你显式请求 `credits` 时旁路读取。唯一的准入控制是**上游自己用 429/402 表示的 per-model 冷却**：
+某个模型被限流后进入冷却（读 `Retry-After` / 响应体中的时刻，上限 2 小时），冷却期内对该模型的请求**立即**
+返回 `429` + `Retry-After`（不排队重试、**不换账号/身份**、不重试风暴），其他模型不受影响；冷却状态出现在
+`/healthz` 与错误体里。
+
+### 客户端接入 / Client setup
+
+任意 OpenAI 兼容客户端（`baseURL = http://127.0.0.1:8317/v1`，`apiKey` = 网关密钥）即可。直接用 `curl`：
+
+```bash
+TOKEN=$(node -e "process.stdout.write(JSON.parse(require('fs').readFileSync(process.env.APPDATA+'/pi-workbuddy-connect/gateway.json','utf8')).token)")
+curl -s http://127.0.0.1:8317/healthz                     # 不需要密钥
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8317/v1/models
+curl -s -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json'   -d '{"model":"workbuddy/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}],"max_tokens":16}'   http://127.0.0.1:8317/v1/chat/completions
+```
+
+pi（或任何读 `models.json` 的客户端）可以按其 OpenAI 兼容 provider 语法指向本端点，例如：
+
+```json
+{ "providers": { "workbuddy": {
+  "type": "openai-completions",
+  "baseUrl": "http://127.0.0.1:8317/v1",
+  "apiKey": "<gateway.json 里的 token>",
+  "models": [ { "id": "workbuddy/deepseek-v4.1-flash" } ]
+} } }
+```
+
+停止：`Ctrl+C`（会删除 `endpoint.json`）。**Windows 上用 `taskkill /F` 强杀不会触发清理**，此时
+`endpoint.json` 会残留，可手动删除。
+
+### 已知限制 / Known limitations
+
+- **CN 企业分支未验证**：`enterpriseId` 非空的 CN 账号走企业额度端点，代码与单测齐备但**无实机证据**。
+- **国际版（WorkBuddy AI）与 RoW 变体未验证**：本机只装了国内版；`ai` 变体的 UA / 目录 / region 分支仅有代码路径。
+- **ToS 风险**：本网关依赖**非官方私有接口**，使用可能违反上游条款，后果自负；默认低频、只读优先，出现风控请停用。
+- **余额变化不可立即观测**：真实推理后余额字段可能不立刻变化（本次实测前后均 `total 692`），因此「服务端按 token 扣费」的证据是上游返回的 `usage`（含 `credit` 字段），而非余额差值。
+- **冷却上限 2 小时**：来自外部观察，非本机实测。
+- **`credits` 端点是本仓自造的便利端点**，不是上游或 OpenAI 标准的一部分。
+
 ## 凭据与安全 / Credentials and safety
 
 - 桌面 App 的 auth 文件**永远只读**（本阶段运行不改变其 mtime）。
@@ -118,10 +207,15 @@ node --test        # 无网络单测；夹具自造，不读真实 token
 ```
 
 ```
-bin/pi-workbuddy-connect.js     CLI 入口
-src/cli.js                      status / doctor、参数解析、输出脱敏自检
-src/credentials/                发现 → 信封解密 → 自留副本 → 生效凭据
-src/upstream/                   域白名单、请求头族、错误分类（唯一出站模块）
+bin/pi-workbuddy-connect.js     CLI 入口（status / doctor / serve）
+src/cli.js                      status / doctor / serve、参数解析、输出脱敏自检
+src/serve.js                    网关装配：store + client + session + catalog + cooldown + server
+src/credentials/                发现 → 信封解密 → 自留副本（SF-6 加密）→ 刷新（单飞 + 退避）
+src/credentials/protection.js   SF-6：AES-256-GCM 封存 + Windows DPAPI / macOS Keychain / Linux libsecret
+src/credentials/session.js      到期前刷新、失败退避、fail-closed
+src/protocol/body.js            OpenAI → 上游 body 映射（强流式 / tool_choice / developer / effort）
+src/upstream/                   域白名单、请求头族、错误分类（唯一出站模块，含 chat/refresh）
+src/gateway/                    回环 HTTP：四道闸、路由、SSE 折叠、per-model 冷却、密钥/端点文件
 src/billing/                    个人 / CN 企业计费解析
 src/catalog/                    目录降级链 live → saved → builtin
 src/util/                       mask / redact

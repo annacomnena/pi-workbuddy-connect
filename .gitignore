@@ -17,3 +17,7 @@ workbuddy-ai-auth.json
 # 本地研究留档（上游包解包、逆向笔记）不入库
 .local-study/
 study/
+# 网关闭钥与端点自述（在 %APPDATA%/pi-workbuddy-connect 下的副本，绝不入库）
+gateway.json
+endpoint.json
+own-copy.key

@@ -6,11 +6,17 @@
 // replayed, and never retried under a different identity.
 
 import { REASON, WbError } from '../errors.js';
-import { upstreamUrl } from './domains.js';
+import { upstreamUrl, chatBaseFor } from './domains.js';
+import { chatHeaders, refreshHeaders } from './headers.js';
 
 export const JSON_TIMEOUT_MS = 30_000;
+/** A streamed answer may legitimately run for minutes; this is a total cap, not an idle one. */
+export const CHAT_TIMEOUT_MS = 15 * 60_000;
 /** Error messages carry at most this many body bytes; the parse itself uses the full body. */
 export const ERROR_BODY_LIMIT = 4096;
+
+export const CHAT_PATH = '/v2/chat/completions';
+export const REFRESH_PATH = '/v2/plugin/auth/token/refresh';
 
 /** A value-free description of a response body, for diagnostics. */
 export function describeBodyShape(text) {
@@ -163,7 +169,14 @@ export function upstreamError({ status, body, headers, context }) {
   return new WbError(
     KIND_TO_REASON[kind],
     `upstream ${kind} (http ${status})${suffix}${retryAfterSeconds === undefined ? '' : `; retry after ${retryAfterSeconds}s`}`,
-    { detail },
+    {
+      detail: {
+        ...detail,
+        // The excerpt is carried for in-process classification (cooldown hints,
+        // localized messages). It is never logged or echoed verbatim.
+        bodyExcerpt: String(body ?? '').slice(0, ERROR_BODY_LIMIT),
+      },
+    },
   );
 }
 
@@ -228,5 +241,95 @@ export class UpstreamClient {
   /** Absolute upstream URL for a base and path, with a host allow-list check. */
   url(base, path) {
     return upstreamUrl(base, path);
+  }
+
+  /**
+   * POST a chat completion and hand back the raw SSE response.
+   *
+   * Unlike {@link send}, this does not read the body: a chat answer is a
+   * stream (the upstream rejects non-streaming bodies), so the body is returned
+   * unconsumed for the gateway to pipe. A non-2xx answer is read, classified and
+   * thrown, so the caller never has to guess a status.
+   *
+   * @returns {Promise<{ status: number, headers: Headers, stream: ReadableStream }>}
+   */
+  async chatStream({ credential, body, userAgent, clientVersion, signal, timeoutMs = CHAT_TIMEOUT_MS }) {
+    const timeoutSignal = AbortSignal.timeout(timeoutMs);
+    const combined = signal === undefined ? timeoutSignal : AbortSignal.any([signal, timeoutSignal]);
+    let response;
+    try {
+      response = await this.fetchImpl(this.url(chatBaseFor(credential), CHAT_PATH), {
+        method: 'POST',
+        headers: chatHeaders(credential, { userAgent, clientVersion }),
+        body,
+        signal: combined,
+      });
+    } catch (error) {
+      throw new WbError(REASON.upstreamUnreachable, 'the chat upstream could not be reached', { cause: error });
+    }
+    if (!response.ok) {
+      const text = await response.text();
+      throw upstreamError({
+        status: response.status,
+        body: text.slice(0, ERROR_BODY_LIMIT),
+        headers: response.headers,
+        context: 'the chat request',
+      });
+    }
+    if (response.body === null || response.body === undefined) {
+      throw new WbError(REASON.upstreamServerError, `the chat upstream returned an empty body (http ${response.status})`);
+    }
+    return { status: response.status, headers: response.headers, stream: response.body };
+  }
+
+  /**
+   * Exchange the refresh token for a fresh access token.
+   *
+   * The refresh token appears on this endpoint only. The answer is returned as
+   * data; writing it is the credential layer's job (and it is written to this
+   * project's own copy, never to the desktop app's file).
+   *
+   * @returns {Promise<{ accessToken: string, refreshToken?: string, expiresInSec?: number,
+   *   refreshExpiresInSec?: number, domain?: string }>}
+   */
+  async refreshToken({ credential, timeoutMs = JSON_TIMEOUT_MS }) {
+    let response;
+    try {
+      response = await this.fetchImpl(this.url(chatBaseFor(credential), REFRESH_PATH), {
+        method: 'POST',
+        headers: refreshHeaders(credential),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (error) {
+      throw new WbError(REASON.upstreamUnreachable, 'the token refresh endpoint could not be reached', { cause: error });
+    }
+    const text = await response.text();
+    const excerpt = text.slice(0, ERROR_BODY_LIMIT);
+    let envelope;
+    try {
+      envelope = readEnvelope(text, response.status);
+    } catch (error) {
+      if (!response.ok) {
+        throw upstreamError({ status: response.status, body: excerpt, headers: response.headers, context: 'the token refresh' });
+      }
+      throw error;
+    }
+    if (!response.ok || envelope.code !== 0) {
+      throw upstreamError({ status: response.status, body: excerpt, headers: response.headers, context: 'the token refresh' });
+    }
+    const data = typeof envelope.data === 'object' && envelope.data !== null ? envelope.data : {};
+    const accessToken = typeof data.accessToken === 'string' ? data.accessToken : '';
+    if (accessToken === '') {
+      throw new WbError(REASON.sessionDead, 'the token refresh returned no access token; sign in again in the desktop app');
+    }
+    return {
+      accessToken,
+      ...(typeof data.refreshToken === 'string' && data.refreshToken !== '' ? { refreshToken: data.refreshToken } : {}),
+      ...(typeof data.expiresIn === 'number' && data.expiresIn > 0 ? { expiresInSec: data.expiresIn } : {}),
+      ...(typeof data.refreshExpiresIn === 'number' && data.refreshExpiresIn > 0
+        ? { refreshExpiresInSec: data.refreshExpiresIn }
+        : {}),
+      ...(typeof data.domain === 'string' && data.domain !== '' ? { domain: data.domain } : {}),
+    };
   }
 }

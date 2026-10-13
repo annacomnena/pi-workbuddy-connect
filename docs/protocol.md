@@ -101,7 +101,33 @@ Envelope-based responses carry a business code plus message/data. Non-zero busin
 classified like HTTP errors. Localised display messages are preferred when present; error bodies are
 truncated (4 KiB) before surfacing. Classes and status mapping: see `mechanism.md` §5.
 
-## 6. Self-imposed limits on outgoing traffic
+## 6. The local gateway surface (S1)
+
+The gateway is a *local* surface, not an upstream one. It speaks OpenAI so any client can point at it:
+
+| Method + path | Bearer | Notes |
+|---|---|---|
+| `GET /healthz` | no | status/version/masked account/decryptability/cooldowns; never contacts upstream; readable by any local process (no bearer) |
+| `GET /v1/models` | yes | OpenAI list; ids are `workbuddy/<upstream model id>`; carries `group`, `context_window`, `max_output_tokens`, `capabilities` and `workbuddy_source` (live/saved/builtin) |
+| `POST /v1/chat/completions` | yes | `stream:true` -> SSE passthrough; `stream:false` -> the SSE is folded into one `chat.completion` |
+| `GET /v1/workbuddy/credits` | yes | **non-standard convenience endpoint**: masked, read-only balance |
+
+Inbound gates run before any route is served: loopback `Host`, loopback `Origin` when present, a
+per-process random bearer compared in constant time, and `application/json` on non-GET requests. Route
+matching happens between the origin and bearer gates, so an unknown path is `404` even without a bearer;
+no data is exposed. The server binds `127.0.0.1` only.
+
+Outbound-wise the gateway is a translator: it forces `stream: true`, maps `workbuddy/<id>` to the
+upstream id, and passes `usage` through. The streaming path forwards the upstream SSE verbatim
+(including every `usage` sub-field such as `credit`); the non-streaming fold normalises `usage` to
+`prompt_tokens` / `completion_tokens` / `total_tokens` and drops fields it does not model such as
+`credit` and `completion_thinking_tokens`. If the upstream stream breaks mid-answer, a
+`workbuddy_truncated` frame is written before `data: [DONE]`; if it breaks before any byte has been
+forwarded, the request is answered `502`. It keeps **no local ledger**: usage and charging are computed
+server-side by the upstream, and the only admission control is a per-model cooldown the upstream itself
+signals with `429`/`402`.
+
+## 7. Self-imposed limits on outgoing traffic
 
 The only outbound hosts are the three upstream hosts above (with credentials) plus, optionally,
 public package/release metadata hosts for update checks (**no credentials, accept-header only**).

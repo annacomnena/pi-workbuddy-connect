@@ -55,10 +55,11 @@ export function commonHeaders(credential) {
   };
 }
 
-/** Chat/probe headers, including the X-No-* conventions. */
+/** Chat/probe headers, including the X-No-* conventions and the bearer. */
 export function chatHeaders(credential, { userAgent, clientVersion }) {
   const headers = {
     ...commonHeaders(credential),
+    Authorization: `Bearer ${credential.accessToken}`,
     'User-Agent': userAgent,
     'Content-Type': 'application/json',
     'X-IDE-Type': 'WorkBuddy',

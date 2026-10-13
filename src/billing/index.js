@@ -2,7 +2,8 @@
 //
 // Reading the balance is the only upstream request S3 makes, and it is a
 // read: the account's usage is described, nothing is charged. There is no
-// local accounting anywhere in this project — the upstream bills by token, and
+// local accounting anywhere in this project — usage and charging are computed
+// server-side by the upstream, and
 // this module only reports what the billing endpoint says.
 //
 // Two upstream shapes exist, chosen by account type:
@@ -16,7 +17,7 @@ import { billingBaseFor, regionOfDomain } from '../upstream/domains.js';
 import { billingHeaders } from '../upstream/headers.js';
 
 const PERSONAL_PATH = '/v2/billing/meter/get-user-resource';
-const ENTERPRISE_URL = 'https://www.codebuddy.cn/v2/billing/meter/get-enterprise-user-usage';
+const ENTERPRISE_PATH = '/v2/billing/meter/get-enterprise-user-usage';
 const PRODUCT_CODE = 'p_tcaca';
 const PACKAGE_END_RANGE_EXTRA_MS = 3_185_136_000_000;
 
@@ -145,17 +146,20 @@ function asBillingFailure(error, endpoint) {
 export async function fetchCredits({ client, credential, now = Date.now() }) {
   const enterprise = regionOfDomain(credential.domain) === 'cn'
     && credential.enterpriseId !== undefined && credential.enterpriseId !== '';
-  const endpoint = enterprise ? ENTERPRISE_URL : client.url(billingBaseFor(credential), PERSONAL_PATH).toString();
+  // Both paths go through the allow-listed URL builder, so the fixed enterprise
+  // target is checked against the upstream host whitelist like any other.
+  const endpointUrl = client.url(billingBaseFor(credential), enterprise ? ENTERPRISE_PATH : PERSONAL_PATH);
+  const endpoint = endpointUrl.toString();
   try {
     const result = enterprise
       ? await client.send({
-        url: endpoint,
+        url: endpointUrl,
         method: 'POST',
         headers: billingHeaders(credential),
         body: JSON.stringify({}),
       })
       : await client.send({
-        url: client.url(billingBaseFor(credential), PERSONAL_PATH),
+        url: endpointUrl,
         method: 'POST',
         headers: billingHeaders(credential),
         body: JSON.stringify({

@@ -47,6 +47,28 @@ test('the enterprise path accepts both field spellings', async () => {
   assert.equal(credits.packages[0].name, 'enterprise');
 });
 
+test('the enterprise path goes through the allow-listed url builder (SF-4)', async () => {
+  const credential = { ...crnCredential, enterpriseId: 'ent-1' };
+  const built = [];
+  const sent = [];
+  const client = {
+    url(base, path) {
+      built.push(path);
+      return new URL(path, base);
+    },
+    async send(args) {
+      sent.push(args.url);
+      return { status: 200, ok: true, headers: { get: () => null }, envelope: { code: 0, data: { data: { limitNum: 1000, used_num: 250 } } }, text: '' };
+    },
+    ensureOk: (result) => result.envelope,
+  };
+  const credits = await fetchCredits({ client, credential, now: Date.now() });
+  assert.equal(credits.total, 750);
+  assert.deepEqual(built, ['/v2/billing/meter/get-enterprise-user-usage']);
+  assert.equal(sent[0] instanceof URL, true);
+  assert.equal(sent[0].hostname, 'www.codebuddy.cn');
+});
+
 test('a sentinel limit means unlimited', async () => {
   const credential = { ...crnCredential, enterpriseId: 'ent-1' };
   const envelope = { code: 0, data: { data: { limitNum: -1, credit: 0 } } };
