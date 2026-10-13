@@ -1,0 +1,24 @@
+{
+  "name": "pi-workbuddy-connect",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only status/doctor CLI (S3 pilot) for reusing the local WorkBuddy desktop app sign-in with your own account and credits.",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "pi-workbuddy-connect": "bin/pi-workbuddy-connect.js"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "files": [
+    "bin",
+    "src",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ]
+}

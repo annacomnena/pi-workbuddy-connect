@@ -43,8 +43,9 @@ is obtainable only through the app's Electron binary — see `security.md`.
 
 Validity / refresh: an access token is refreshed when it is within a small margin of expiry, against
 the upstream refresh endpoint, using a dedicated refresh-token header. The refreshed credential is
-written **only into this project's own state directory** (mode `0600`). The desktop app's auth file is
-**never written to**.
+written **only into this project's own state directory** (mode `0600` on POSIX; on Windows there is
+no POSIX mode and the copy relies on the user profile's inherited ACLs — see `security.md` §6). The
+desktop app's auth file is **never written to**.
 
 ## 2. Upstream endpoints (all 5 kinds)
 

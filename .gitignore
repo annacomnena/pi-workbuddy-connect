@@ -9,6 +9,11 @@ dist/
 token*.json
 **/tokens/**
 *cookie*
+# 本机桌面登录态快照 / 自有副本（绝不入库）
+workbuddy-desktop*.info
+workbuddy-auth.json
+workbuddy-ai-auth.json
+.workbuddy*.json
 # 本地研究留档（上游包解包、逆向笔记）不入库
 .local-study/
 study/

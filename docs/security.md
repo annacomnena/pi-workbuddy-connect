@@ -50,3 +50,37 @@ Additional hardening: a request body size limit, and an idle timeout on upstream
 - `.gitignore` covers credentials, tokens, cookies and local state snapshots.
 - CI scans the tree for token-like patterns and fails on a hit.
 - Documentation and issues must reference **field names**, never values.
+
+## 6. Owner-copy permissions (S3)
+
+A refreshed token, if one is ever written, goes to a project-owned directory with owner-only
+permissions:
+
+| Platform | Directory | Mode |
+|---|---|---|
+| Windows | `%APPDATA%\pi-workbuddy-connect\` | directory only; NTFS ACLs are not `chmod` |
+| macOS | `~/Library/Application Support/pi-workbuddy-connect/` | `0700` dir, `0600` file |
+| Linux | `$XDG_STATE_HOME` (or `~/.local/state`) `/pi-workbuddy-connect/` | `0700` dir, `0600` file |
+
+Notes and residual risks:
+
+- The at-rest key used to unwrap the desktop credential is held **in memory only**. It is never
+  written to disk, never cached, and never sent anywhere.
+- A copy in a home directory may still be captured by backups, file-sync clients, or a shared
+  machine. Excluding the path above from sync/backup is the owner's responsibility.
+- On Windows there is no POSIX mode; the copy is only as private as the user profile's ACLs. This is
+  the reason S3 stores nothing but the credential and does not persist the at-rest key.
+
+## 7. Log-leak warning
+
+The desktop app's own log directory may contain **plaintext** bearer values in some builds. This
+project **never reads or copies those logs**, and neither should you. If you paste diagnostics into a
+public issue, scan them first for token shapes; the CLI's own output is already masked and passes a
+pre-print token self-check.
+
+## 8. Fail-closed diagnostics (S3)
+
+`doctor` distinguishes credential states instead of collapsing them into "not signed in": missing,
+unreadable, undecryptable, region-mismatched, expired, and unreachable are separate reason codes. The
+`status` / `doctor` documents are scanned for token shapes and for the exact secrets the process holds
+before printing, and are withheld if a hit is found.
