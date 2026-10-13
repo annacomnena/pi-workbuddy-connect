@@ -108,17 +108,20 @@ The gateway is a *local* surface, not an upstream one. It speaks OpenAI so any c
 | Method + path | Bearer | Notes |
 |---|---|---|
 | `GET /healthz` | no | status/version/masked account/decryptability/cooldowns; never contacts upstream; readable by any local process (no bearer) |
-| `GET /v1/models` | yes | OpenAI list; ids are `workbuddy/<upstream model id>`; carries `group`, `context_window`, `max_output_tokens`, `capabilities` and `workbuddy_source` (live/saved/builtin) |
-| `POST /v1/chat/completions` | yes | `stream:true` -> SSE passthrough; `stream:false` -> the SSE is folded into one `chat.completion` |
+| `GET /v1/models` | yes | OpenAI list; `id` is the **bare upstream model id**, plus `workbuddy_prefixed_id` carrying the historical `workbuddy/<id>` spelling and `workbuddy_id_style: "bare"`; **only the exposed set is listed** (`workbuddy_exposed` reports mode/exposed/total); every entry also carries `group`, `context_window`, `max_output_tokens`, `capabilities` and (`workbuddy_source` live/saved/builtin, at the list level) |
+| `POST /v1/chat/completions` | yes | `stream:true` -> SSE passthrough; `stream:false` -> the SSE is folded into one `chat.completion`; a model the exposure policy hides is `404` with `error.code="model_not_found"` and `workbuddy_reason_code="model-not-exposed"` (a policy filter, not a security boundary) |
 | `GET /v1/workbuddy/credits` | yes | **non-standard convenience endpoint**: masked, read-only balance |
 
 Inbound gates run before any route is served: loopback `Host`, loopback `Origin` when present, a
 per-process random bearer compared in constant time, and `application/json` on non-GET requests. Route
 matching happens between the origin and bearer gates, so an unknown path is `404` even without a bearer;
-no data is exposed. The server binds `127.0.0.1` only.
+no data is exposed. The server binds `127.0.0.1` only. The model-exposure policy (S2.1) lives in this
+project's `gateway.json` (`models.mode` / `models.expose`) and is shared by `GET /v1/models`,
+`POST /v1/chat/completions` and `install-provider`; it is a local filter, not a security boundary.
 
-Outbound-wise the gateway is a translator: it forces `stream: true`, maps `workbuddy/<id>` to the
-upstream id, and passes `usage` through. The streaming path forwards the upstream SSE verbatim
+Outbound-wise the gateway is a translator: it forces `stream: true`, strips the optional `workbuddy/`
+prefix (both spellings are accepted, because `stripModelPrefix` is applied to whatever the client sent),
+and passes `usage` through. The streaming path forwards the upstream SSE verbatim
 (including every `usage` sub-field such as `credit`); the non-streaming fold normalises `usage` to
 `prompt_tokens` / `completion_tokens` / `total_tokens` and drops fields it does not model such as
 `credit` and `completion_thinking_tokens`. If the upstream stream breaks mid-answer, a

@@ -73,8 +73,8 @@ export function writeJson(res, status, body, headers = {}) {
  * Write an OpenAI-shaped error.
  * @returns {object} the body that was written
  */
-export function writeOpenAiError(res, status, type, message, headers = {}) {
-  const body = { error: { message, type, code: type } };
+export function writeOpenAiError(res, status, type, message, headers = {}, extra = {}) {
+  const body = { error: { message, type, code: type, ...extra } };
   writeJson(res, status, body, headers);
   return body;
 }

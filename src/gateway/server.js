@@ -2,19 +2,26 @@
 //
 // Routes:
 //   GET  /healthz                  no bearer; status + masked account + cooldowns
-//   GET  /v1/models                bearer; OpenAI list, `workbuddy/<id>` ids
-//   POST /v1/chat/completions      bearer; `stream: true` (SSE) or `false`
+//   GET  /v1/models                bearer; OpenAI list, ids are the upstream's own
+//                                  (`workbuddy_prefixed_id` carries the legacy
+//                                  `workbuddy/<id>` spelling); filtered to the
+//                                  exposure policy from gateway.json
+//   POST /v1/chat/completions      bearer; `stream: true` (SSE) or `false`;
+//                                  a model the policy hides is a 404
+//                                  `model_not_found` (+ `workbuddy_reason_code`)
 //   GET  /v1/workbuddy/credits     bearer; NON-STANDARD, masked balance
 //
-// The gateway does not do billing. Usage and charging are computed server-side
-// by the upstream; this process has no local ledger, no pre-deduction and no
-// balance gate.
+// The exposure policy is a local *filter*, not a security boundary: the bearer
+// secret is the gate. The gateway does not do billing. Usage and charging are
+// computed server-side by the upstream; this process has no local ledger, no
+// pre-deduction and no balance gate.
 // Its only admission control is the per-model cooldown the upstream itself
 // signals with a 429 (or a hard-credit 402).
 
 import { createServer } from 'node:http';
+import { createConnection } from 'node:net';
 import { Readable } from 'node:stream';
-import { REASON, describeError, reasonCodeOf } from '../errors.js';
+import { REASON, WbError, describeError, reasonCodeOf } from '../errors.js';
 import { UPSTREAM_HOSTS } from '../upstream/domains.js';
 import { extractDisplayMessage, parseRetryAfter } from '../upstream/client.js';
 import { parseChatRequest, prepareChatBody, stripModelPrefix } from '../protocol/body.js';
@@ -38,6 +45,7 @@ import {
 } from './openai.js';
 import { cooldownSecondsFrom } from './cooldown.js';
 import { sessionStateOf } from '../credentials/session.js';
+import { DEFAULT_MODELS_CONFIG, filterModels, isExposed } from '../provider/models-config.js';
 
 export const SERVICE_NAME = 'pi-workbuddy-connect';
 export const BIND_HOST = '127.0.0.1';
@@ -63,6 +71,32 @@ function bearerMatches(header, expected) {
 import { timingSafeEqual } from 'node:crypto';
 
 /**
+ * Is something already listening on this loopback port?
+ *
+ * A plain `listen()` cannot be trusted on Windows: two sockets may bind the
+ * same port when the first did not ask for exclusive use (observed with
+ * EasyCLIProxyAPI on 8317), so the bind *succeeds* and the traffic is split
+ * unpredictably. An explicit connect probe is what actually tells us the port
+ * is taken.
+ */
+function portBusy(port, host = BIND_HOST, timeoutMs = 400) {
+  return new Promise((resolve) => {
+    const socket = createConnection({ port, host });
+    let settled = false;
+    const done = (busy) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(busy);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => done(true));
+    socket.once('timeout', () => done(false));
+    socket.once('error', () => done(false));
+  });
+}
+
+/**
  * Create the gateway server.
  *
  * @param {object} deps
@@ -74,6 +108,8 @@ import { timingSafeEqual } from 'node:crypto';
  * @param {string} deps.variantId
  * @param {'cn'|'global'} deps.region
  * @param {string} deps.userAgent
+ * @param {{ mode: 'all'|'allowlist', expose: string[] }} [deps.modelsFilter]
+ *   the exposure policy read from gateway.json; defaults to "expose all"
  * @param {Function} [deps.fetchCredits]  injectable for tests
  * @param {object} [deps.logger]
  * @param {number} [deps.startedAt]
@@ -94,7 +130,9 @@ export function createGateway({
   logger,
   startedAt = Date.now(),
   now = Date.now,
+  modelsFilter = DEFAULT_MODELS_CONFIG,
 }) {
+  const exposure = modelsFilter ?? DEFAULT_MODELS_CONFIG;
   let sessionDead = null;
   let lastAnswer = null;
 
@@ -167,6 +205,11 @@ export function createGateway({
       tokenSource,
       credential,
       catalog: { source: catalog.source, count: catalog.models?.length ?? 0, ...(catalog.degradedReason === undefined ? {} : { degradedReason: catalog.degradedReason }) },
+      exposedModels: {
+        mode: exposure.mode,
+        count: filterModels(catalog.models ?? [], exposure).length,
+        ...(exposure.mode === 'allowlist' ? { allowlist: [...exposure.expose] } : {}),
+      },
       cooldowns: cooldowns.snapshot(),
       upstreamHosts: [...UPSTREAM_HOSTS],
       limits: { requestBodyBytes: REQUEST_BODY_LIMIT },
@@ -184,11 +227,27 @@ export function createGateway({
       const mapped = mapUpstreamError(error);
       return writeOpenAiError(res, mapped.status, mapped.type, mapped.message);
     }
-    writeJson(res, 200, modelList(catalog.models, {
+    const allModels = Array.isArray(catalog.models) ? catalog.models : [];
+    const exposed = filterModels(allModels, exposure);
+    const doc = modelList(exposed, {
       group: variantId,
       source: catalog.source,
       degradedReason: catalog.degradedReason,
-    }));
+    });
+    // Say out loud that a filter is in force, so a short list is never mistaken
+    // for the full upstream roster.
+    doc.workbuddy_exposed = {
+      mode: exposure.mode,
+      exposed: exposed.length,
+      total: allModels.length,
+      ...(exposure.mode === 'allowlist' ? { allowlist: [...exposure.expose] } : {}),
+    };
+    if (exposure.mode === 'allowlist') {
+      const present = new Set(exposed.map((model) => model.id));
+      const missing = exposure.expose.filter((id) => !present.has(id));
+      if (missing.length > 0) doc.workbuddy_exposed.missing = missing;
+    }
+    writeJson(res, 200, doc);
   }
 
   async function credits(res) {
@@ -245,6 +304,20 @@ export function createGateway({
     const advertisedModel = request.model;
     const upstreamModel = stripModelPrefix(request.model);
     const wantsStream = request.stream === true;
+
+    // Policy filter (S2.1): a model the user chose not to expose is refused
+    // with a clear OpenAI-shaped 404 carrying this project's own reason code.
+    // It is a local policy, not a security boundary -- the bearer is the gate.
+    if (!isExposed(upstreamModel, exposure)) {
+      return writeOpenAiError(
+        res,
+        404,
+        'model_not_found',
+        `the gateway does not expose the model ${JSON.stringify(upstreamModel)} (a local policy filter, not a security boundary); run \`pi-workbuddy-connect models add ${upstreamModel}\` or \`models all\``,
+        {},
+        { workbuddy_reason_code: REASON.modelNotExposed },
+      );
+    }
 
     const cooling = cooldowns.status(upstreamModel, now());
     if (cooling.cooling) {
@@ -459,15 +532,53 @@ export function createGateway({
     server,
     handle,
     /** Bind to loopback only. Nothing else is ever permitted here. */
-    listen(port) {
+    async listen(port, { allowFallback = false } = {}) {
+      // A preferred (config/default) port that is already serving must not be
+      // shared; probe it first, then fall back to an OS-chosen free port. An
+      // explicitly requested port stays explicit and fails loudly.
+      let candidate = port;
+      let fallback = false;
+      if (candidate !== 0 && await portBusy(candidate)) {
+        if (allowFallback) {
+          candidate = 0;
+          fallback = true;
+        } else {
+          // S-3: the caller asked for this port explicitly. Report the declared
+          // reason code instead of a bare EADDRINUSE so the failure is diagnosable.
+          throw new WbError(
+            REASON.portUnavailable,
+            `the requested port 127.0.0.1:${candidate} is already in use; pass a different --port or stop whatever holds it`,
+            { detail: { port: candidate } },
+          );
+        }
+      }
       return new Promise((resolve, reject) => {
-        const onError = (error) => reject(error);
-        server.once('error', onError);
-        server.listen(port, BIND_HOST, () => {
-          server.removeListener('error', onError);
-          const address = server.address();
-          resolve(typeof address === 'object' && address !== null ? address.port : port);
-        });
+        const attempt = (target, isFallback) => {
+          const onError = (error) => {
+            server.removeListener('error', onError);
+            if (!isFallback && allowFallback && target !== 0 && (error.code === 'EADDRINUSE' || error.code === 'EACCES')) {
+              attempt(0, true);
+              return;
+            }
+            if (error.code === 'EADDRINUSE' && target !== 0) {
+              // The probe above lost a race; keep the same contract.
+              reject(new WbError(
+                REASON.portUnavailable,
+                `the requested port 127.0.0.1:${target} is already in use; pass a different --port or stop whatever holds it`,
+                { cause: error, detail: { port: target } },
+              ));
+              return;
+            }
+            reject(error);
+          };
+          server.once('error', onError);
+          server.listen(target, BIND_HOST, () => {
+            server.removeListener('error', onError);
+            const address = server.address();
+            resolve(typeof address === 'object' && address !== null ? address.port : target);
+          });
+        };
+        attempt(candidate, fallback);
       });
     },
     close() {

@@ -10,18 +10,23 @@
 // replaced by an error document rather than printed.
 
 import process from 'node:process';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { CredentialStore } from './credentials/index.js';
 import { resolveAppVersion } from './credentials/electron.js';
-import { REASON, describeError, reasonCodeOf } from './errors.js';
-import { resolveOptions } from './config.js';
+import { REASON, WbError, describeError, reasonCodeOf } from './errors.js';
+import { resolveOptions, parsePort } from './config.js';
 import { UpstreamClient } from './upstream/client.js';
 import { fetchCredits } from './billing/index.js';
-import { resolveCatalog } from './catalog/index.js';
+import { resolveCatalog, loadSavedCatalog } from './catalog/index.js';
 import { LEAK_PATTERNS, findLeaks } from './util/redact.js';
 import { maskIdentifier, maskKeyId, maskSecret } from './util/mask.js';
-import { displayPath } from './paths.js';
-import { DEFAULT_PORT, TOKEN_ENV, PORT_ENV } from './gateway/secret.js';
+import { displayPath, ensureOwnDir } from './paths.js';
+import { DEFAULT_PORT, TOKEN_ENV, PORT_ENV, readGatewayConfig } from './gateway/secret.js';
 import { startServe } from './serve.js';
+import { installProvider, resolveModelsJsonPath, uninstallProvider } from './provider/install.js';
+import { normalizeModelsConfig, readModelsConfig, validateModelIds, writeModelsConfig } from './provider/models-config.js';
+import { PROVIDER_KEY, canonicalModelId, jsonEqual, stripBom } from './provider/models-json.js';
 
 export const SCHEMA_VERSION = 1;
 
@@ -31,6 +36,16 @@ Usage:
   pi-workbuddy-connect status [options]   read the local sign-in and credit balance
   pi-workbuddy-connect doctor [options]   diagnose why the local sign-in is unusable
   pi-workbuddy-connect serve [options]    run the loopback OpenAI-compatible gateway
+  pi-workbuddy-connect models <action>    choose which models the gateway exposes
+  pi-workbuddy-connect install-provider [options]    add providers.workbuddy to pi's models.json
+  pi-workbuddy-connect uninstall-provider [options]  remove providers.workbuddy again
+
+Models actions:
+  models list                 show the current policy and the known models
+  models set <id...>          expose exactly these models (allowlist)
+  models add <id...>          add models to the allowlist
+  models remove <id...>       remove models from the allowlist
+  models all                  expose every model the catalog knows
 
 Options:
   --json                 machine-readable output
@@ -41,6 +56,13 @@ Options:
   --catalog              status: refresh the model catalog live (one extra request)
   --decrypt              doctor: actually unwrap the credential (runs the app's key helper)
   --port <n>             serve: listening port on 127.0.0.1 (default ${DEFAULT_PORT}; env: ${PORT_ENV})
+                         install-provider: the port the generated baseUrl points at
+                         (default: the live endpoint.json port, then gateway.json.port)
+  --models <a,b,...>     serve/install-provider: expose only these models for this run
+  --dry-run              install/uninstall-provider/models: write nothing, back up nothing
+  --models-json <path>   install/uninstall-provider: edit this file instead of
+                         <agent dir>/models.json (default: $PI_CODING_AGENT_DIR or ~/.pi/agent)
+  --api-key-env <NAME>   install-provider: store \`$NAME\` instead of the gateway secret itself
   --help                 this text
   --version              print the version
 
@@ -51,8 +73,18 @@ Notes:
   * doctor never sends credentials and never prints one; it reports reason codes.
   * serve binds 127.0.0.1 ONLY and requires a random per-process bearer secret
     (this project's gateway.json, overridable with ${TOKEN_ENV}).
-    GET /healthz needs no bearer; every other route does. The gateway does no
-    local billing: the upstream charges per token on the server side.
+    GET /healthz needs no bearer; every other route does. A preferred port that
+    is already taken falls back to an OS-chosen free port and the real port is
+    written to endpoint.json. The gateway does no local billing: the upstream
+    charges per token on the server side.
+  * The model-exposure policy is one setting in gateway.json, shared by
+    \`GET /v1/models\`, \`POST /v1/chat/completions\` and install-provider. It is a
+    policy filter, not a security boundary; the bearer secret is the gate.
+  * install-provider never contacts an upstream and never runs the app's key
+    helper: the model list comes from this project's saved catalog (refresh it
+    with \`status --catalog\`) or from the built-in placeholder roster. It edits
+    ONLY providers.workbuddy in models.json, backs the file up first, and is
+    idempotent. The gateway must be running (\`serve\`) for the models to answer.
 
 This tool is unofficial and unrelated to Tencent. It only reuses the sign-in of
 your own local app, spends your own credits, and writes nothing to the app.
@@ -70,6 +102,9 @@ export function parseArgs(argv) {
       case 'status':
       case 'doctor':
       case 'serve':
+      case 'models':
+      case 'install-provider':
+      case 'uninstall-provider':
         if (command !== undefined) return { error: `unexpected command ${JSON.stringify(token)}` };
         command = token;
         break;
@@ -77,18 +112,30 @@ export function parseArgs(argv) {
       case '--no-network': flags.noNetwork = true; break;
       case '--catalog': flags.catalog = true; break;
       case '--decrypt': flags.decrypt = true; break;
+      case '--dry-run': flags.dryRun = true; break;
       case '--help': case '-h': flags.help = true; break;
       case '--version': case '-v': flags.version = true; break;
       case '--variant': flags.variant = argv[++index]; break;
       case '--auth-file': flags.authFile = argv[++index]; break;
       case '--electron': flags.electron = argv[++index]; break;
       case '--port': flags.port = argv[++index]; break;
+      case '--api-key-env': flags.apiKeyEnv = argv[++index]; break;
+      case '--models-json': flags.modelsJson = argv[++index]; break;
+      case '--models': flags.models = argv[++index]; break;
       default:
         if (token.startsWith('--variant=')) flags.variant = token.slice('--variant='.length);
         else if (token.startsWith('--auth-file=')) flags.authFile = token.slice('--auth-file='.length);
         else if (token.startsWith('--electron=')) flags.electron = token.slice('--electron='.length);
         else if (token.startsWith('--port=')) flags.port = token.slice('--port='.length);
-        else return { error: `unknown argument ${JSON.stringify(token)}` };
+        else if (token.startsWith('--api-key-env=')) flags.apiKeyEnv = token.slice('--api-key-env='.length);
+        else if (token.startsWith('--models-json=')) flags.modelsJson = token.slice('--models-json='.length);
+        else if (token.startsWith('--models=')) flags.models = token.slice('--models='.length);
+        else if (command === 'models' && !token.startsWith('-')) {
+          // `models <action> <id...>`: the first bare token is the action, the
+          // rest are model ids.
+          if (flags.modelsAction === undefined) flags.modelsAction = token;
+          else (flags.modelsIds ??= []).push(token);
+        } else return { error: `unknown argument ${JSON.stringify(token)}` };
     }
   }
   return { command, flags };
@@ -425,9 +472,65 @@ function renderSessionHuman(session) {
 
 function renderHuman(document) {
   const lines = [];
+  if (document.command === 'install-provider' && document.ok === true && document.securityWarning) {
+    // SF-1: the plaintext-secret warning is the first thing the user sees.
+    lines.push(`!! ${document.securityWarning}`, '');
+  }
+  if (document.command === 'models') {
+    lines.push(`pi-workbuddy-connect models ${document.action}`);
+    lines.push(`policy: mode=${document.config.mode}${document.config.mode === 'allowlist' ? ` expose=${document.config.expose.join(', ')}` : ''}`);
+    lines.push(`catalog: ${document.catalog.source} (${document.catalog.count} models)`);
+    if (document.changed === false) lines.push(document.note ?? 'no change');
+    else if (document.dryRun) lines.push('dry run: gateway.json and models.json were not written');
+    else lines.push('wrote the policy to gateway.json');
+    if (document.sync !== undefined) {
+      if (document.sync.attempted === false) lines.push(`sync: ${document.sync.note}`);
+      else if (document.sync.ok === true) lines.push(`sync: providers.${document.provider} ${document.sync.changed ? 'updated' : 'already matched'} (${document.sync.models} models, baseUrl ${document.sync.baseUrl})`);
+      else lines.push(`sync: FAILED — ${document.sync.error.reasonCode}: ${document.sync.error.message}`);
+    }
+    lines.push(`redaction self-check: ${document.redactionSelfCheck?.ok === false ? 'FAILED' : 'ok'}`);
+    return `${lines.join('\n')}\n`;
+  }
+  if (document.command === 'install-provider' || document.command === 'uninstall-provider') {
+    lines.push(`pi-workbuddy-connect ${document.command}${document.variantName === undefined ? '' : ` — ${document.variantName} (${document.variant})`}`);
+    if (document.ok === false) {
+      lines.push(`models.json: ${document.modelsJson ?? '(unresolved)'}`);
+      lines.push(`FAILED — ${document.error?.reasonCode ?? 'unknown'}${document.error?.message ? `: ${document.error.message}` : ''}`);
+      lines.push(`redaction self-check: ${document.redactionSelfCheck?.ok === false ? 'FAILED' : 'ok'}`);
+      return `${lines.join('\n')}\n`;
+    }
+    lines.push(`models.json: ${document.modelsJson}${document.modelsJsonExisted ? '' : ' (created)'}`);
+  }
+  if (document.command === 'install-provider') {
+    lines.push(`provider: ${document.provider} → ${document.baseUrl} (port from ${document.portSource ?? 'default'})`);
+    lines.push(`exposure: mode=${document.exposure?.mode ?? 'all'}${document.exposure?.mode === 'allowlist' ? ` (${document.exposure.expose.length} model(s))` : ''}`);
+    lines.push(`api key: ${document.apiKey.style === 'literal' ? `literal (${document.apiKey.masked}), from ${document.apiKey.tokenSource}` : `$${document.apiKey.env} (from ${document.apiKey.tokenSource})`} — value never printed`);
+    // S-2: the interpolation only works if the variable exists in the
+    // environment that starts pi; say so in human output too, not only in --json.
+    if (document.apiKey.note !== undefined) lines.push(`note: ${document.apiKey.note}`);
+    lines.push(`catalog: ${document.catalog.source} (${document.catalog.count} models)${document.catalog.fetchedAt ? ` @ ${document.catalog.fetchedAt}` : ''}${document.catalog.note ? ` — ${document.catalog.note}` : ''}`);
+    if (document.dryRun) lines.push('dry run: nothing was written, no backup was taken');
+    else if (!document.changed) lines.push('already installed and up to date: the file was not written');
+    else lines.push(`wrote 1 provider member${document.replaced ? ' (replaced)' : ''}; backup: ${document.backup ?? '(none needed)'}; write: ${document.write?.mode ?? 'atomic'}`);
+    if (document.diff) lines.push('', document.diff.replace(/\n$/u, ''));
+    for (const warning of document.warnings ?? []) lines.push(`warning: ${warning}`);
+    lines.push(`redaction self-check: ${document.redactionSelfCheck?.ok === false ? 'FAILED' : 'ok'}`);
+    return `${lines.join('\n')}\n`;
+  }
+  if (document.command === 'uninstall-provider') {
+    lines.push(`provider: ${document.provider}`);
+    if (document.dryRun) lines.push('dry run: nothing was written, no backup was taken');
+    else if (!document.changed) lines.push(document.note ?? 'nothing to remove');
+    else lines.push(`removed 1 provider member; backup: ${document.backup ?? '(none needed)'}; write: ${document.write?.mode ?? 'atomic'}`);
+    if (document.diff) lines.push('', document.diff.replace(/\n$/u, ''));
+    lines.push(`redaction self-check: ${document.redactionSelfCheck?.ok === false ? 'FAILED' : 'ok'}`);
+    return `${lines.join('\n')}\n`;
+  }
   if (document.command === 'serve') {
     lines.push(`pi-workbuddy-connect serve — ${document.variantName} (${document.variant}, region ${document.region})`);
     lines.push(`listening: ${document.url} (${document.bind ?? document.host} only)`);
+    if (document.portFallback !== undefined) lines.push(`port: preferred ${document.portFallback.requested} was busy (${document.portFallback.source}); bound ${document.portFallback.actual}`);
+    lines.push(`exposed models: ${document.modelsExposed?.mode === 'allowlist' ? `allowlist (${document.modelsExposed.allowlist.length})` : 'all'}`);
     lines.push(`bearer: ${document.token.source} — ${document.token.path} (value not printed)`);
     lines.push(`user-agent: ${document.userAgent} (app version ${document.appVersion.value}, ${document.appVersion.source})`);
     lines.push(`endpoint file: ${document.endpointFile}`);
@@ -468,6 +571,166 @@ function renderHuman(document) {
   }
   lines.push(`redaction self-check: ${document.redactionSelfCheck?.ok === false ? 'FAILED' : 'ok'}`);
   return `${lines.join('\n')}\n`;
+}
+
+/**
+ * Resolve the persisted exposure policy and preferred port for the commands
+ * that need them. `--models` is a process-only override; otherwise the `models`
+ * field of gateway.json is the single source of truth.
+ */
+function applyGatewayConfig(options) {
+  const ownDir = ensureOwnDir(options.ownDir);
+  const gatewayConfig = readGatewayConfig(ownDir);
+  options.gatewayConfig = gatewayConfig;
+  options.modelsFilter = options.modelsFlag === undefined
+    ? normalizeModelsConfig(gatewayConfig.models)
+    : normalizeModelsConfig({ mode: 'allowlist', expose: options.modelsFlag });
+  // An explicit `--models` list is validated against the saved roster when there
+  // is one; with only the built-in placeholder we cannot know the real roster, so
+  // it is left to the live catalog at request time.
+  if (options.modelsFlag !== undefined) {
+    const saved = loadSavedCatalog(join(ownDir, options.variant.catalogFilename));
+    if (saved !== undefined) {
+      const { invalid, available } = validateModelIds(options.modelsFlag, saved.models);
+      if (invalid.length > 0) {
+        throw new WbError(REASON.modelUnknown, `--models names unknown model(s) ${invalid.map((id) => JSON.stringify(id)).join(', ')}; candidates: ${available.join(', ')}`);
+      }
+    }
+  }
+  if (options.port === undefined) {
+    if (gatewayConfig.port !== undefined) {
+      options.port = parsePort(gatewayConfig.port, 'gateway.json port');
+      options.portSource = 'config';
+    } else {
+      options.port = DEFAULT_PORT;
+      options.portSource = 'default';
+    }
+  }
+  return options;
+}
+
+/**
+ * After the policy changes, keep the installed provider in step. Chosen
+ * behaviour (documented in README): auto-sync when `providers.workbuddy` is
+ * already installed; otherwise say so instead of silently doing nothing.
+ */
+async function syncInstalledProvider(options, nextConfig, catalog, secrets) {
+  const env = options.env ?? process.env;
+  const path = resolveModelsJsonPath({ modelsJsonPath: options.modelsJsonPath, env });
+  if (!existsSync(path)) {
+    return { attempted: false, installed: false, note: `no models.json at ${displayPath(path)}; run install-provider when you want pi to see these models` };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(stripBom(readFileSync(path, 'utf8')));
+  } catch {
+    return { attempted: false, installed: false, note: 'models.json could not be parsed; run install-provider to re-check it' };
+  }
+  if (parsed?.providers?.[PROVIDER_KEY] === undefined) {
+    return { attempted: false, installed: false, note: 'providers.workbuddy is not installed; run install-provider to apply the policy' };
+  }
+  try {
+    const built = await installProvider({ ...options, modelsFilter: nextConfig, secrets }, { catalog });
+    return {
+      attempted: true,
+      installed: true,
+      ok: true,
+      changed: built.document.changed,
+      baseUrl: built.document.baseUrl,
+      models: built.document.modelRefs.length,
+      backup: built.document.backup,
+    };
+  } catch (error) {
+    return {
+      attempted: true,
+      installed: true,
+      ok: false,
+      error: { reasonCode: reasonCodeOf(error) ?? 'unexpected-error', message: describeError(error) },
+    };
+  }
+}
+
+const MODELS_ACTIONS = new Set(['list', 'set', 'add', 'remove', 'all']);
+
+/** `models` — read and edit the exposure policy in gateway.json. */
+async function runModels(options, { out, err }) {
+  const action = options.modelsAction ?? 'list';
+  if (!MODELS_ACTIONS.has(action)) {
+    err.write(`unknown models action ${JSON.stringify(action)}\n\n${USAGE}`);
+    return 2;
+  }
+  const ownDir = ensureOwnDir(options.ownDir);
+  const secrets = options.secrets ?? [];
+  options.secrets = secrets;
+  try {
+    const config = readModelsConfig(ownDir);
+    const catalog = await resolveCatalog({ savedPath: join(ownDir, options.variant.catalogFilename), network: false });
+    const catalogModels = Array.isArray(catalog.models) ? catalog.models : [];
+    const available = catalogModels.map((model) => canonicalModelId(model.id));
+    const document = {
+      schema: SCHEMA_VERSION,
+      command: 'models',
+      action,
+      generatedAt: new Date().toISOString(),
+      ok: true,
+      provider: PROVIDER_KEY,
+      variant: options.variant.id,
+      previous: config,
+      config,
+      changed: false,
+      dryRun: options.dryRun === true,
+      catalog: { source: catalog.source, count: available.length, models: available },
+    };
+
+    let next = config;
+    if (action === 'all') {
+      next = { mode: 'all', expose: [] };
+    } else if (action !== 'list') {
+      if (options.modelsIds.length === 0) {
+        throw new WbError(REASON.invalidRequest, `\`models ${action}\` needs at least one model id (known: ${available.join(', ')})`);
+      }
+      const { valid, invalid, available: candidates } = validateModelIds(options.modelsIds, catalogModels);
+      if (invalid.length > 0) {
+        throw new WbError(REASON.modelUnknown, `unknown model id(s) ${invalid.map((id) => JSON.stringify(id)).join(', ')}; candidates: ${candidates.join(', ')}`);
+      }
+      const base = action === 'set' ? [] : (config.mode === 'allowlist' ? config.expose : available);
+      let expose = [...base];
+      if (action === 'remove') expose = expose.filter((id) => !valid.includes(id));
+      else for (const id of valid) if (!expose.includes(id)) expose.push(id);
+      next = normalizeModelsConfig({ mode: 'allowlist', expose });
+    }
+    document.changed = !jsonEqual(config, next);
+    document.config = next;
+
+    if (document.changed && !document.dryRun) {
+      await writeModelsConfig(ownDir, next);
+      document.written = true;
+      document.sync = await syncInstalledProvider(options, next, catalog, secrets);
+    } else if (document.changed) {
+      document.note = 'dry run: gateway.json and models.json were not written';
+    } else {
+      document.note = `the policy already is mode=${next.mode}${next.mode === 'allowlist' ? ` expose=${next.expose.join(',')}` : ''}; nothing was written`;
+    }
+
+    const { text, ok } = finalizeDocument(document, secrets, options.json);
+    out.write(text);
+    // S-1: the policy was written, but if the installed provider could not be
+    // brought in step, the run is not a success; exit non-zero instead of
+    // leaving a green exit code on a `sync: FAILED` line.
+    return ok && document.sync?.ok !== false ? 0 : 1;
+  } catch (error) {
+    const reasonCode = reasonCodeOf(error) ?? 'unexpected-error';
+    const document = {
+      schema: SCHEMA_VERSION,
+      command: 'models',
+      action,
+      ok: false,
+      error: { reasonCode, message: describeError(error) },
+    };
+    const { text } = finalizeDocument(document, secrets, options.json);
+    out.write(text);
+    return 1;
+  }
 }
 
 /** Run the gateway until a termination signal arrives. */
@@ -524,8 +787,51 @@ export async function runCli(argv, { out = process.stdout, err = process.stderr,
     return 2;
   }
 
+  if (parsed.command === 'models') {
+    try {
+      applyGatewayConfig(options);
+    } catch (error) {
+      const document = { schema: SCHEMA_VERSION, command: 'models', action: parsed.flags.modelsAction ?? 'list', ok: false, error: { reasonCode: reasonCodeOf(error) ?? 'unexpected-error', message: describeError(error) } };
+      const { text } = finalizeDocument(document, [], options.json);
+      out.write(text);
+      return 1;
+    }
+    return await runModels(options, { out, err });
+  }
+
   if (parsed.command === 'serve') {
+    try {
+      applyGatewayConfig(options);
+    } catch (error) {
+      err.write(`${describeError(error)}\n`);
+      return 2;
+    }
     return await runServe(options, { out, err, env });
+  }
+
+  if (parsed.command === 'install-provider' || parsed.command === 'uninstall-provider') {
+    const secrets = [];
+    options.secrets = secrets;
+    try {
+      if (parsed.command === 'install-provider') applyGatewayConfig(options);
+      const built = parsed.command === 'install-provider'
+        ? await installProvider(options)
+        : await uninstallProvider(options);
+      const { text, ok } = finalizeDocument(built.document, secrets, options.json);
+      out.write(text);
+      return ok ? 0 : 1;
+    } catch (error) {
+      const reasonCode = reasonCodeOf(error) ?? 'unexpected-error';
+      const document = {
+        schema: SCHEMA_VERSION,
+        command: parsed.command,
+        ok: false,
+        error: { reasonCode, message: describeError(error) },
+      };
+      const { text } = finalizeDocument(document, secrets, options.json);
+      out.write(text);
+      return 1;
+    }
   }
 
   // Shared with buildStatus/buildDoctor so the catch below can self-check the

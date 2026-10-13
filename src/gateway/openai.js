@@ -60,12 +60,22 @@ export function mapUpstreamError(error) {
 /**
  * The OpenAI model list document, annotated with the group, the context window
  * and the capabilities the catalog carries.
+ *
+ * `id` is the **bare** upstream model id. That is what pi's own canonical model
+ * reference is built from (`<provider>/<id>`, up to the first slash), so an
+ * installed `workbuddy` provider makes the pi reference `workbuddy/glm-5.3`
+ * while the id a client sends in a request body stays `glm-5.3`.
+ *
+ * The historical `workbuddy/<id>` spelling is not dropped: requests carrying it
+ * are still accepted (`stripModelPrefix`), and every entry advertises it as
+ * `workbuddy_prefixed_id` so an old configuration can still be found.
  */
 export function modelList(models, { group, source, degradedReason } = {}) {
   return {
     object: 'list',
     data: models.map((model) => ({
-      id: withModelPrefix(model.id),
+      id: model.id,
+      workbuddy_prefixed_id: withModelPrefix(model.id),
       object: 'model',
       created: 0,
       owned_by: 'workbuddy',
@@ -81,8 +91,10 @@ export function modelList(models, { group, source, degradedReason } = {}) {
         ...(model.defaultEffort === undefined ? {} : { default_effort: model.defaultEffort }),
       },
     })),
-    // Non-standard provenance fields: which rung of live -> saved -> built-in
-    // answered, so a stale list is never mistaken for the live one.
+    // Non-standard fields: how ids are spelled, and which rung of
+    // live -> saved -> built-in answered, so a stale list is never mistaken for
+    // the live one.
+    workbuddy_id_style: 'bare',
     ...(source === undefined ? {} : { workbuddy_source: source }),
     ...(degradedReason === undefined ? {} : { workbuddy_degraded_reason: degradedReason }),
   };

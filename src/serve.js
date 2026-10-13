@@ -18,7 +18,8 @@ import { fetchCredits } from './billing/index.js';
 import { createCatalogSource } from './gateway/catalog-cache.js';
 import { ModelCooldowns } from './gateway/cooldown.js';
 import { createGateway, SERVICE_NAME } from './gateway/server.js';
-import { describeTokenSource, loadOrCreateToken, writeEndpointFile, removeEndpointFile, removeStaleEndpointFile } from './gateway/secret.js';
+import { describeTokenSource, loadOrCreateToken, writeEndpointFile, removeEndpointFile, removeStaleEndpointFile, DEFAULT_PORT } from './gateway/secret.js';
+import { readModelsConfig } from './provider/models-config.js';
 import { ensureOwnDir, displayPath } from './paths.js';
 
 /** Versions used only when the local app's own version cannot be read. */
@@ -71,6 +72,8 @@ export async function startServe(options, deps = {}) {
     logger.info?.('removed a stale endpoint.json left by a process that is no longer running');
   }
   const tokenInfo = loadOrCreateToken(ownDir, env);
+  // The exposure policy (S2.1): read once, hand to the gateway and report it.
+  const modelsFilter = options.modelsFilter ?? readModelsConfig(ownDir);
   const store = deps.store ?? new CredentialStore({
     variant: options.variant,
     authFile: options.authFile,
@@ -134,9 +137,22 @@ export async function startServe(options, deps = {}) {
     logger,
     startedAt: deps.startedAt ?? Date.now(),
     now: options.now,
+    modelsFilter,
   });
 
-  const port = await gateway.listen(options.port);
+  // Port policy: `--port` > env/config > default. A preferred port that is
+  // already taken falls back to an OS-chosen free port (the real machine has
+  // EasyCLIProxyAPI on the old default); an explicit `--port` fails loudly.
+  const requestedPort = options.port ?? DEFAULT_PORT;
+  const port = await gateway.listen(requestedPort, { allowFallback: options.portExplicit !== true });
+  const portFallback = port !== requestedPort && requestedPort !== 0
+    ? { requested: requestedPort, actual: port, source: options.portSource ?? 'default' }
+    : undefined;
+  if (portFallback !== undefined) {
+    const warning = `the preferred port ${requestedPort} (${portFallback.source}) was already in use, so the gateway bound ${port} instead; endpoint.json records the real port`;
+    warnings.push(warning);
+    logger.warn?.(warning);
+  }
   const url = `http://127.0.0.1:${port}`;
   const endpointFile = writeEndpointFile(ownDir, {
     port,
@@ -152,8 +168,14 @@ export async function startServe(options, deps = {}) {
     ok: true,
     service: SERVICE_NAME,
     url,
+    baseUrl: `${url}/v1`,
     host: '127.0.0.1',
     port,
+    ...(portFallback === undefined ? {} : { portFallback }),
+    modelsExposed: {
+      mode: modelsFilter.mode,
+      ...(modelsFilter.mode === 'allowlist' ? { allowlist: [...modelsFilter.expose] } : {}),
+    },
     variant: options.variant.id,
     variantName: options.variant.displayName,
     region: options.variant.region,

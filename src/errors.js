@@ -32,6 +32,26 @@ export const REASON = Object.freeze({
   gatewayCooling: 'gateway-cooling',
   gatewayTokenUnavailable: 'gateway-token-unavailable',
   ownCopyUnprotected: 'own-copy-unprotected',
+  // models.json (S2) states. Installing a provider must never fail in a way that
+  // leaves the user's own model list in doubt, so an unreadable or non-plain-JSON
+  // file is reported by name instead of being overwritten.
+  modelsJsonUnreadable: 'models-json-unreadable',
+  // models.json changed between the read and the write (S2.1, SF-2): fail closed
+  // instead of clobbering an edit made by another process in that window.
+  modelsJsonChanged: 'models-json-changed',
+  // Model-exposure policy (S2.1). `models` config lives in gateway.json; an
+  // unreadable policy is reported by name, and a request for a model the policy
+  // hides is a 404 `model_not_found` carrying this reason code.
+  modelsConfigUnreadable: 'models-config-unreadable',
+  // gateway.json changed between the read and the write (S2.1, S-5): the same
+  // fail-closed guard models.json has (SF-2), so a concurrent `models set` and a
+  // hand edit cannot silently lose one of the two updates.
+  gatewayConfigChanged: 'gateway-config-changed',
+  modelUnknown: 'model-unknown',
+  modelNotExposed: 'model-not-exposed',
+  // The requested gateway port was taken and the caller asked for it explicitly
+  // (`--port`), so no fallback is allowed.
+  portUnavailable: 'port-unavailable',
 });
 
 /** An error that always travels with a machine-readable reason code. */

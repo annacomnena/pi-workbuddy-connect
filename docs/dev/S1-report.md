@@ -18,10 +18,10 @@
 | 四道闸是否实测 | ✅ 离线测试逐条反例：坏 Host→403、坏 Origin→403、无/错 Bearer→401、非 JSON content-type→415；`/healthz` 免 Bearer（只回状态） |
 | 端点是否齐全 | ✅ `/healthz`、`/v1/models`（18 个真实模型，`workbuddy/<id>` + 分组/上下文/能力）、`/v1/chat/completions`（SSE + 非流式）、`/v1/workbuddy/credits`（标注非标准） |
 | 真实推理是否成功 | ✅ **2 次**（≤2 上限）：非流式 HTTP 200 / 2.66 s / usage 13+2=15；流式 HTTP 200 / 2.24 s / 4 帧（3 chunk + `[DONE]`）/ usage 8+1=9 |
-| 积分是否可见变化 | ❌ **未观察到**：`credits` 前后 `total` **完全相同**（数值按 SF-5 扣留）。可主张的是「**上游做服务端计量**」与「**本工具不做任何本地预扣/记账/余额闸门**」两类事实；**本会话无证据表明这 24 token 被扣费**（`credit:0` 更直接指向本次计 0 credit）。可能的解释见 §8.4 |
+| 积分是否可见变化 | ❌ **未观察到**：`credits` 前后 `total` **完全相同**（数值按 SF-5 扣留）。可主张的是「**上游做服务端计量**」与「**本工具不做任何本地预扣/记账/余额闸门**」两类事实；**本会话无证据表明这 24 token 被扣费**（`credit:0` 更直接指向本次计 0 credit）。可能的解释见 §8.4 —— **（指针）该结论仅适用于 24 token 小请求；大请求实验见 `docs/dev/S1-billing-experiment.md`，已观测到余额下降** |
 | 离线测试 | ✅ `node --test` **128/128 全绿**（无网络；网关测试只连 `127.0.0.1`，上游为注入假对象）；审查整改新增 7 个用例（其中 6 个 MF-1/SF-1 目标用例用注入缺陷方式自证可区分修复前后，见 §12） |
 | SF-6 | ✅ 自留副本不再是明文：用**同一 at-rest key** AES-256-GCM 封存（实机验证 `containsPlaintextToken=false`、`roundTripOk=true`）；无 at-rest key 时走 OS 设施（DPAPI/Keychain/libsecret）；两者都无 → 显式降级 + 启动告警 |
-| 未做项 | 企业分支 / 国际版未实机验证；余额变化未观测到；`endpoint.json` 在 Windows 强杀后残留（见 §9） |
+| 未做项 | 企业分支 / 国际版未实机验证；余额变化未观测到（**（指针）后续大请求实验已观测到下降，归因待收口，见 `docs/dev/S1-billing-experiment.md`**）；`endpoint.json` 在 Windows 强杀后残留（见 §9） |
 
 ---
 
@@ -203,7 +203,7 @@ $ timeout 300 node --test
 | 目录 | `GET /v1/models`（Bearer） | ✅ HTTP 200，`source=live`、**18** 个模型；`workbuddy/hy4-preview`(ctx 960000)、`workbuddy/hy3`(192000)、`workbuddy/deepseek-v4.1-flash`(1000000)、`workbuddy/glm-5.3`(1000000)… |
 | 推理 #1 | `POST /v1/chat/completions` `stream:false`，`model=workbuddy/deepseek-v4.1-flash`，`max_tokens=16`，`temperature=0` | ✅ HTTP 200 / **2.66 s** |
 | 推理 #2 | 同模型 `stream:true`，`max_tokens=16` | ✅ HTTP 200 / **2.24 s** |
-| 余额 | `GET /v1/workbuddy/credits` ×2（推理前后各一次） | ✅ 两次 HTTP 200；`total` **前后完全相同** |
+| 余额 | `GET /v1/workbuddy/credits` ×2（推理前后各一次） | ✅ 两次 HTTP 200；`total` **前后完全相同**（**（指针）小请求、24 token；大请求对照见 `docs/dev/S1-billing-experiment.md`**） |
 | 停止 | `taskkill /F`（见 §9 说明） | ✅ 端口释放，无残留进程 |
 
 ### 8.2 推理 #1（非流式）响应（实测，仅 id/掩码类值已替换）
@@ -234,12 +234,14 @@ frames: 4
 
 ### 8.4 credits 前后对比（关键结论：未观察到减少）
 
+> **（指针）本节结论已被 `docs/dev/S1-billing-experiment.md` 的大请求观测部分取代**：大请求后立即 −1、约 1.5–2 h 后 −12。本节原始实测值不改写，仅说明适用范围。
+
 | 时点 | `total` | `unlimited` | 结构 |
 |---|---|---|---|
 | 推理前 | `<redacted>` | `false` | 4 个资源包（名称与 `remain`/`size` 数值扣留） |
 | 推理后 | **与前完全相同** | `false` | 同上 |
 
-结论：**15 + 9 = 24 token 的消耗在余额字段上不可观测**。可公开主张的只有两类事实：
+结论：**15 + 9 = 24 token 的消耗在余额字段上不可观测**。可公开主张的只有两类事实：（**（指针）小请求、24 token；大请求见 `docs/dev/S1-billing-experiment.md`，已观测到下降**）
 （a）本工具**不做任何本地预扣/记账/余额闸门**（chat 路径不调用计费接口，可 grep 证实）；
 （b）上游对单次请求做**服务端计量**（§8.3 的 `usage` 由上游给出）。
 但**本会话没有任何证据表明这 24 token 实际扣减了积分**——`credit:0` 更直接地指向「本次请求计 0 credit」。
@@ -250,7 +252,9 @@ frames: 4
 3. **计量口径粗**：`total` 是整包剩余，24 token 的消耗低于显示/上报粒度；
 4. **余额字段语义不同**：`total` 来自资源包 `remain`，可能不含按量计费部分。
 
-要确立「按 token 扣费」需要一次**显式授权**的前后余额对照（加大 token 量到可观测粒度、并在结算窗口后复测），
+> **（指针）后续实验补充第 5 条可能来源：其它客户端 / 桌面 App 同期消耗**（本机实测有多个 `WorkBuddy.exe` 进程在跑）；见 `docs/dev/S1-billing-experiment.md` §2 归因不干净一节。
+
+要确立「按 token 扣费」需要一次**显式授权**的前后余额对照（加大 token 量到可观测粒度、并在结算窗口后复测），（**（指针）已启动**：见 `docs/dev/S1-billing-experiment.md` §3，需用户再授权 1 次）
 或上游文档；本阶段证据不足。
 
 ### 8.5 启动文档（`serve --json`，本地、无推理）
@@ -284,7 +288,7 @@ SF-6 未降级（`protected: true`）；`warnings` 为空（无 at-rest key 缺�
 
 1. **CN 企业分支未实机验证**：本机 `enterprise=false`，走个人计费端点；企业端点仅单测覆盖。
 2. **国际版（`--variant ai`）/ RoW 未实机验证**：本机未装 WorkBuddy AI；global 的 UA / 目录 / 首条 system 分支只有代码与单测。
-3. **余额变化未观测到**（§8.4）：无法用余额差值证明扣费；已如实记录，不粉饰。
+3. **余额变化未观测到**（§8.4）：无法用余额差值证明扣费；已如实记录，不粉饰。（**（指针）大请求实验已观测到下降，见 `docs/dev/S1-billing-experiment.md`；归因待收口**）
 4. **Windows 优雅关闭**：`serve` 已注册 `SIGINT`/`SIGTERM` → `close()` 会删除 `endpoint.json`；但 Windows 上用 `taskkill /F`（或 git-bash `kill -INT`）**不会**触发该处理器，`endpoint.json` 会残留（本次实测已手动删除）。真实用户按 Ctrl+C 正常。已在 README 写明。
 5. **`/healthz` 首次调用会解封凭据**（本地、只读，30 s 缓存）。若桌面凭据为加密且 App 二进制缺失，`/healthz` 报 `credential.state=error` 而非崩溃——符合 fail-closed。
 6. **目录刷新 TTL 10 min**：`/v1/models` 在 TTL 内用缓存；`?refresh=1` 强制实时。上游改协议时按 live→saved→builtin 降级并标 `workbuddy_source`/`workbuddy_degraded_reason`（R2）。

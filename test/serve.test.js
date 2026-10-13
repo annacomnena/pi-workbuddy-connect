@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { mkdtempSync, writeFileSync, readFileSync, existsSync, statSync } from 'node:fs';
-import { request as httpRequest } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { startServe, describeOwnCopyProtection, FALLBACK_APP_VERSIONS } from '../src/serve.js';
@@ -155,6 +155,65 @@ test('an endpoint.json left by a dead process is removed at startup (SF-5)', () 
   writeFileSync(file, 'not json');
   assert.equal(removeStaleEndpointFile(dir), true);
   assert.equal(existsSync(file), false);
+});
+
+test('a preferred port that is taken falls back to a free port and records the real one', async () => {
+  const dir = tempDir();
+  const blocker = createServer(() => {});
+  await new Promise((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+  const taken = blocker.address().port;
+  try {
+    const authFile = join(dir, 'workbuddy-desktop.info');
+    writeFileSync(authFile, JSON.stringify(makePlainAuthDocument()));
+    const logger = quietLogger();
+    const serving = await startServe({
+      variant: VARIANTS.cn,
+      port: taken,
+      authFile,
+      env: { APPDATA: dir },
+      ownDir: join(dir, 'pi-workbuddy-connect'),
+      network: true,
+      json: true,
+    }, { logger, appVersion: '5.7.7', env: { APPDATA: dir }, out: { write() {} } });
+    try {
+      assert.notEqual(serving.port, taken, 'the taken port must not be reused');
+      assert.equal(serving.document.portFallback.requested, taken);
+      assert.equal(serving.document.portFallback.actual, serving.port);
+      assert.equal(serving.document.warnings.some((line) => /already in use/u.test(line)), true);
+      const endpoint = JSON.parse(readFileSync(serving.endpointFile, 'utf8'));
+      assert.equal(endpoint.port, serving.port);
+      assert.equal(endpoint.baseUrl, `http://127.0.0.1:${serving.port}/v1`);
+    } finally {
+      await serving.close();
+    }
+  } finally {
+    await new Promise((resolve) => blocker.close(resolve));
+  }
+});
+
+test('an explicit --port that is taken fails loudly instead of silently moving', async () => {
+  const dir = tempDir();
+  const blocker = createServer(() => {});
+  await new Promise((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+  const taken = blocker.address().port;
+  try {
+    const authFile = join(dir, 'workbuddy-desktop.info');
+    writeFileSync(authFile, JSON.stringify(makePlainAuthDocument()));
+    await assert.rejects(
+      startServe({
+        variant: VARIANTS.cn,
+        port: taken,
+        portExplicit: true,
+        authFile,
+        env: { APPDATA: dir },
+        ownDir: join(dir, 'pi-workbuddy-connect'),
+        network: true,
+      }, { logger: quietLogger(), appVersion: '5.7.7', env: { APPDATA: dir }, out: { write() {} } }),
+      (error) => error.name === 'WbError' && error.code === 'port-unavailable' && /127\.0\.0\.1:\d+ is already in use/u.test(error.message),
+    );
+  } finally {
+    await new Promise((resolve) => blocker.close(resolve));
+  }
 });
 
 test('describeOwnCopyProtection reports the at-rest key as available for an encrypted desktop', async () => {

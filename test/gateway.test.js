@@ -3,7 +3,7 @@
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { request as httpRequest } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { Readable } from 'node:stream';
 import { createGateway } from '../src/gateway/server.js';
 import { ModelCooldowns } from '../src/gateway/cooldown.js';
@@ -99,7 +99,7 @@ function fakeStore(credential = CREDENTIAL) {
   };
 }
 
-async function startGateway(options = {}) {
+function buildGateway(options = {}) {
   const client = options.client ?? okClient();
   const store = options.store ?? fakeStore();
   const session = createSessionResolver({ store, client });
@@ -117,6 +117,7 @@ async function startGateway(options = {}) {
     region: 'cn',
     userAgent: 'WorkBuddy/5.7.7 WorkBuddy/5.7.7',
     tokenSource: 'config',
+    modelsFilter: options.modelsFilter,
     fetchCredits: options.fetchCredits ?? (async () => ({
       total: 4321,
       unlimited: false,
@@ -125,8 +126,13 @@ async function startGateway(options = {}) {
     })),
     startedAt: Date.now() - 5000,
   });
-  const port = await gateway.listen(0);
-  return { gateway, client, store, cooldowns, port };
+  return { gateway, client, store, cooldowns };
+}
+
+async function startGateway(options = {}) {
+  const built = buildGateway(options);
+  const port = await built.gateway.listen(0);
+  return { ...built, port };
 }
 
 function call(port, { method = 'GET', path = '/', headers = {}, body } = {}) {
@@ -217,15 +223,20 @@ test('gate 4: a non-JSON content type on POST is 415', async () => {
   });
 });
 
-test('/v1/models emits the OpenAI list shape with workbuddy/ ids and metadata', async () => {
+test('/v1/models emits the OpenAI list shape with bare ids and the legacy alias', async () => {
   await withGateway({}, async ({ port }) => {
     const res = await call(port, { path: '/v1/models', headers: auth() });
     assert.equal(res.status, 200);
     const body = JSON.parse(res.text);
     assert.equal(body.object, 'list');
     assert.equal(body.data.length, 2);
+    assert.equal(body.workbuddy_id_style, 'bare');
     const [first] = body.data;
-    assert.equal(first.id, 'workbuddy/hy3');
+    // The advertised id is the bare upstream id, so an installed `workbuddy`
+    // provider makes the pi model reference `workbuddy/hy3` while the request
+    // body keeps `hy3`.
+    assert.equal(first.id, 'hy3');
+    assert.equal(first.workbuddy_prefixed_id, 'workbuddy/hy3');
     assert.equal(first.object, 'model');
     assert.equal(first.owned_by, 'workbuddy');
     assert.equal(first.group, 'cn');
@@ -234,6 +245,41 @@ test('/v1/models emits the OpenAI list shape with workbuddy/ ids and metadata', 
     assert.equal(first.capabilities.reasoning, true);
     assert.equal(body.data[1].credits, 'x0.79');
     assert.equal(body.workbuddy_source, 'live');
+  });
+});
+
+test('the exposure policy filters /v1/models and refuses a hidden model with 404 (S2.1)', async () => {
+  const modelsFilter = { mode: 'allowlist', expose: ['glm-5.3'] };
+  await withGateway({ modelsFilter }, async ({ port }) => {
+    const list = await call(port, { path: '/v1/models', headers: auth() });
+    assert.equal(list.status, 200);
+    const body = JSON.parse(list.text);
+    assert.deepEqual(body.data.map((model) => model.id), ['glm-5.3']);
+    assert.equal(body.workbuddy_exposed.mode, 'allowlist');
+    assert.equal(body.workbuddy_exposed.total, 2);
+    assert.equal(body.workbuddy_exposed.exposed, 1);
+
+    // A hidden model is a clear OpenAI-shaped 404 carrying this project's code.
+    const hidden = await call(port, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: auth({ 'content-type': 'application/json' }),
+      body: chatBody(),
+    });
+    assert.equal(hidden.status, 404);
+    const error = JSON.parse(hidden.text).error;
+    assert.equal(error.type, 'model_not_found');
+    assert.equal(error.code, 'model_not_found');
+    assert.equal(error.workbuddy_reason_code, 'model-not-exposed');
+
+    // The exposed model still answers.
+    const allowed = await call(port, {
+      method: 'POST',
+      path: '/v1/chat/completions',
+      headers: auth({ 'content-type': 'application/json' }),
+      body: JSON.stringify({ model: 'workbuddy/glm-5.3', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(allowed.status, 200);
   });
 });
 
@@ -566,4 +612,20 @@ test('a failing balance read is reported with the upstream class, not swallowed'
     assert.equal(res.status, 429);
     assert.equal(JSON.parse(res.text).error.type, 'soft_rate');
   });
+});
+
+test('an explicitly requested port that is taken reports the declared reason code (S-3)', async () => {
+  const blocker = createServer(() => {});
+  await new Promise((resolve) => blocker.listen(0, '127.0.0.1', resolve));
+  const taken = blocker.address().port;
+  const { gateway } = buildGateway();
+  try {
+    await assert.rejects(
+      gateway.listen(taken, { allowFallback: false }),
+      (error) => error.name === 'WbError' && error.code === REASON.portUnavailable && error.detail.port === taken && /already in use/u.test(error.message),
+    );
+  } finally {
+    await gateway.close();
+    await new Promise((resolve) => blocker.close(resolve));
+  }
 });
