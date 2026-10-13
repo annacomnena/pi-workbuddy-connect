@@ -12,7 +12,15 @@
 
 - 上游同生态参考实现（公开、MIT）：[`dsh-workbuddy-connect`](https://github.com/corrinehu/dsh-workbuddy-connect) —— 我们**只借鉴其"观察到的协议事实"**，实现为**净室重写**；如确实复用了其代码片段，会在文件头保留其版权与许可声明。
 - 本仓目标：**独立插件**（不依赖、也不集成进任何特定 harness 的 runtime），可独立运行。
-- 设计与机制报告落地后会在 `docs/` 公布。
+
+机制与协议文档已在 `docs/` 公布：
+
+- [`docs/mechanism.md`](./docs/mechanism.md) — 工作机制（登录态来源、端点、积分语义、线协议要点）
+- [`docs/protocol.md`](./docs/protocol.md) — 端点与字段参考
+- [`docs/security.md`](./docs/security.md) — 凭据处理与回环网关安全模型
+- [`docs/compliance.md`](./docs/compliance.md) — 非官方声明、边界与 Do-NOT 清单
+
+> 文档只写**字段名与结构**，不含任何凭据值、账号标识或个人数据。
 
 ## 范围与不做的事 / Scope
 
